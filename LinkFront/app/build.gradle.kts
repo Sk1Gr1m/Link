@@ -7,21 +7,19 @@ plugins {
 
 android {
     namespace = "com.example.linkfront"
-    compileSdk = 36
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.linkfront"
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters.add("armeabi-v7a")
             abiFilters.add("arm64-v8a")
-            abiFilters.add("x86")
             abiFilters.add("x86_64")
         }
     }
@@ -49,9 +47,17 @@ android {
 
 chaquopy {
     defaultConfig {
-        buildPython("python3.10")
+        // Upgrade to Python 3.13 for the phone
+        version = "3.13"
+        
+        // Use your system Python (3.13.7) for the build process
+        buildPython("/usr/bin/python3")
+
         pip {
-            install("matplotlib")
+            install("pynacl")
+            install("qrcode")
+            install("pillow")
+            install("pytest")
         }
     }
 }
