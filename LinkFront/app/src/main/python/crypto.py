@@ -13,10 +13,12 @@ def encrypt(msg: str):
 
 def decrypt(cipher):
     """Decrypts a byte array ciphertext using a hardcoded key."""
-    # Ensure cipher is a bytes object. Chaquopy's ByteArray might be interpreted 
-    # as a sequence of signed integers, causing OverflowError in NaCl bindings.
+    # Java's byte[] contains signed bytes (-128 to 127). 
+    # When Chaquopy passes this to Python, it may be treated as a sequence of signed integers.
+    # PyNaCl's C bindings expect unsigned bytes (0 to 255).
     if not isinstance(cipher, (bytes, bytearray)):
-        cipher = bytes(cipher % 256 for cipher in cipher) if isinstance(cipher, (list, tuple)) else bytes(cipher)
+        # Convert signed bytes to unsigned bytes
+        cipher = bytes(x & 0xff for x in cipher)
     return _box.decrypt(cipher).decode()
 
 def derive_key(shared_secret, id_a, id_b):

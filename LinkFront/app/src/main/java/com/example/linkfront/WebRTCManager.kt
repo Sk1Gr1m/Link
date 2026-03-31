@@ -1,15 +1,21 @@
 package com.example.linkfront
 
 import android.content.Context
+import android.util.Log
+import com.chaquo.python.Python
 import org.webrtc.*
 import java.nio.ByteBuffer
 
 class WebRTCManager(context: Context) {
+    private val TAG = "WebRTCManager"
     private val peerConnectionFactory: PeerConnectionFactory
     private val peerA: PeerConnection
     private val peerB: PeerConnection
     private var channelA: DataChannel? = null
     private var channelB: DataChannel? = null
+    
+    private val py = Python.getInstance()
+    private val cryptoModule = py.getModule("crypto")
 
     init {
         PeerConnectionFactory.initialize(
@@ -29,12 +35,10 @@ class WebRTCManager(context: Context) {
         channelA?.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(p0: Long) {}
             override fun onStateChange() {
-                println("Channel A state: ${channelA?.state()}")
+                Log.d(TAG, "Channel A state: ${channelA?.state()}")
             }
             override fun onMessage(buffer: DataChannel.Buffer) {
-                val data = ByteArray(buffer.data.remaining())
-                buffer.data.get(data)
-                println("A received: ${String(data)}")
+                onReceive(buffer, "A")
             }
         })
 
@@ -58,12 +62,10 @@ class WebRTCManager(context: Context) {
                     channelB?.registerObserver(object : DataChannel.Observer {
                         override fun onBufferedAmountChange(p0: Long) {}
                         override fun onStateChange() {
-                            println("Channel B state: ${channelB?.state()}")
+                            Log.d(TAG, "Channel B state: ${channelB?.state()}")
                         }
                         override fun onMessage(buffer: DataChannel.Buffer) {
-                            val data = ByteArray(buffer.data.remaining())
-                            buffer.data.get(data)
-                            println("B received: ${String(data)}")
+                            onReceive(buffer, "B")
                         }
                     })
                 }
@@ -95,12 +97,39 @@ class WebRTCManager(context: Context) {
         }, constraints)
     }
 
-    fun sendFromAToB(message: String) {
-        val buffer = DataChannel.Buffer(
-            ByteBuffer.wrap(message.toByteArray()),
-            false
-        )
-        channelA?.send(buffer)
+    // --- Transport Layer ---
+
+    /**
+     * Entry point for sending messages. Encrypts with Python before sending.
+     */
+    fun sendEncrypted(message: String) {
+        try {
+            val encryptedBytes = cryptoModule.callAttr("encrypt", message).toJava(ByteArray::class.java)
+            Log.d(TAG, "A sent encrypted bytes: ${encryptedBytes.contentToString()}")
+            
+            val buffer = DataChannel.Buffer(
+                ByteBuffer.wrap(encryptedBytes),
+                true // Binary data
+            )
+            channelA?.send(buffer)
+        } catch (e: Exception) {
+            Log.e(TAG, "Encryption/Send failed", e)
+        }
+    }
+
+    /**
+     * Entry point for receiving messages. Decrypts with Python.
+     */
+    private fun onReceive(buffer: DataChannel.Buffer, receiverLabel: String) {
+        val data = ByteArray(buffer.data.remaining())
+        buffer.data.get(data)
+        
+        try {
+            val decryptedMessage = cryptoModule.callAttr("decrypt", data).toString()
+            Log.d(TAG, "$receiverLabel received: $decryptedMessage")
+        } catch (e: Exception) {
+            Log.e(TAG, "Decryption failed on $receiverLabel", e)
+        }
     }
 }
 

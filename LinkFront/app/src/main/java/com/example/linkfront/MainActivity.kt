@@ -56,14 +56,14 @@ class MainActivity : ComponentActivity() {
             LinkFrontTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Column(modifier = Modifier.padding(innerPadding).padding(16.dp)) {
-                        Text(text = "WebRTC Dual-Peer Handshake")
+                        Text(text = "WebRTC + PyNaCl Encryption")
                         Spacer(modifier = Modifier.height(16.dp))
                         Button(onClick = {
                             if (::webrtcManager.isInitialized) {
-                                webrtcManager.sendFromAToB("Hello from Peer A!")
+                                webrtcManager.sendEncrypted("Hello from Peer A (Encrypted)!")
                             }
                         }) {
-                            Text("Send 'Hello' from A to B")
+                            Text("Send Encrypted 'Hello' from A to B")
                         }
                     }
                 }
