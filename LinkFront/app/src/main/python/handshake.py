@@ -1,26 +1,18 @@
-from nacl.public import PrivateKey
-from nacl.public import PublicKey
-from nacl.public import Box
+from nacl.public import PrivateKey, PublicKey
+from nacl.bindings import crypto_scalarmult
 
-from .crypto import derive_key
+def generate_keypair():
+    """Generates an ephemeral X25519 keypair."""
+    priv = PrivateKey.generate()
+    pub = priv.public_key
+    return bytes(priv), bytes(pub)
 
-
-class Handshake:
-
-    def __init__(self):
-
-        self.private = PrivateKey.generate()
-        self.public = self.private.public_key
-
-    def public_bytes(self):
-        return self.public.encode()
-
-    def create_shared(self, peer_public, id_a, id_b):
-
-        peer_key = PublicKey(peer_public)
-
-        box = Box(self.private, peer_key)
-
-        shared = box.shared_key()
-
-        return derive_key(shared, id_a, id_b)
+def derive_shared(priv_bytes, peer_pub_bytes):
+    """Derives a shared session key using X25519."""
+    # Ensure bytes
+    if not isinstance(priv_bytes, (bytes, bytearray)):
+        priv_bytes = bytes(x & 0xff for x in priv_bytes)
+    if not isinstance(peer_pub_bytes, (bytes, bytearray)):
+        peer_pub_bytes = bytes(x & 0xff for x in peer_pub_bytes)
+        
+    return crypto_scalarmult(priv_bytes, peer_pub_bytes)
