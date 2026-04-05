@@ -1,6 +1,8 @@
 package com.example.linkfront
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import com.chaquo.python.PyObject
@@ -12,7 +14,9 @@ import java.nio.charset.StandardCharsets
 
 class WebRTCManager(
     private val context: Context,
-    private val onConnectionRequest: (String, String, ByteArray, (Boolean) -> Unit) -> Unit
+    private val onConnectionRequest: (String, String, ByteArray, (Boolean) -> Unit) -> Unit,
+    var onMessageReceived: ((String) -> Unit)? = null,
+    var onStateChanged: ((String) -> Unit)? = null
 ) {
     private val TAG = "WebRTCManager"
     private val peerConnectionFactory: PeerConnectionFactory
@@ -35,6 +39,35 @@ class WebRTCManager(
     private var ephemeralPublicKey: ByteArray? = null
     private var session: PyObject? = null
     private var onIceGatheringComplete: ((String) -> Unit)? = null
+    private val gatheringHandler = Handler(Looper.getMainLooper())
+    private val gatheringTimeoutRunnable = Runnable {
+        finishGathering()
+    }
+
+    private fun finishGathering() {
+        gatheringHandler.removeCallbacks(gatheringTimeoutRunnable)
+        val localDescription = peerConnection?.localDescription
+        if (localDescription != null && onIceGatheringComplete != null) {
+            Log.d(TAG, "Gathering finished early (or complete). Sending SDP.")
+            val thinnedSdp = thinSdp(localDescription.description)
+            onIceGatheringComplete?.invoke(thinnedSdp)
+            onIceGatheringComplete = null
+        }
+    }
+
+    private fun thinSdp(sdp: String): String {
+        // Removes unnecessary lines to make the QR code smaller
+        return sdp.split("\n").filter { line ->
+            !line.startsWith("a=extmap:") &&
+            !line.startsWith("a=rtcp-fb:") &&
+            !line.startsWith("a=fmtp:") &&
+            !line.startsWith("a=msid:") &&
+            !line.startsWith("a=ssrc:") &&
+            !line.startsWith("a=mid:") &&
+            !line.startsWith("a=bundle-only") &&
+            line.isNotBlank()
+        }.joinToString("\n")
+    }
 
     init {
         val prefs = context.getSharedPreferences("link_identity", Context.MODE_PRIVATE)
@@ -87,17 +120,14 @@ class WebRTCManager(
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 Log.d(TAG, "ICE Gathering State: $state")
                 if (state == PeerConnection.IceGatheringState.COMPLETE) {
-                    val localDescription = peerConnection?.localDescription
-                    if (localDescription != null) {
-                        onIceGatheringComplete?.invoke(localDescription.description)
-                        onIceGatheringComplete = null
-                    }
+                    finishGathering()
                 }
             }
 
             override fun onSignalingChange(state: PeerConnection.SignalingState) {}
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
                 Log.d(TAG, "ICE Connection State: $state")
+                onStateChanged?.invoke("ICE: $state")
             }
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>) {}
@@ -141,6 +171,10 @@ class WebRTCManager(
     fun createOffer(callback: (String) -> Unit) {
         onIceGatheringComplete = callback
         initDataChannel()
+        
+        // Start a 3-second timeout. If gathering isn't complete by then, we just use what we have.
+        gatheringHandler.postDelayed(gatheringTimeoutRunnable, 3000)
+
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 peerConnection?.setLocalDescription(SimpleSdpObserver(), sdp)
@@ -154,6 +188,8 @@ class WebRTCManager(
             override fun onSetSuccess() {
                 if (type == SessionDescription.Type.OFFER) {
                     onIceGatheringComplete = onAnswerReady
+                    // Start a 3-second timeout for the Answer gathering
+                    gatheringHandler.postDelayed(gatheringTimeoutRunnable, 3000)
                     createAnswer()
                 }
             }
@@ -174,33 +210,45 @@ class WebRTCManager(
         return identity?.callAttr("get_qr_data", myUsername).toString()
     }
 
+    fun getConnectionQrData(callback: (String) -> Unit) {
+        createOffer { sdp ->
+            val qrData = identity?.callAttr("get_connection_qr", myUsername, sdp, "offer").toString()
+            callback(qrData)
+        }
+    }
+
     fun getFingerprint(key: ByteArray? = null): String {
         return if (key == null) {
             identity?.callAttr("get_fingerprint")?.toString() ?: "UNKNOWN"
         } else {
-            identityModule.callAttr("verify_signature", byteArrayOf(), byteArrayOf(), byteArrayOf()) // Dummy call to ensure module loaded? No.
-            // I should add a top-level get_fingerprint to identity.py or use the Identity object.
-            // Let's check identity.py again.
-            "FINGERPRINT_NOT_IMPLEMENTED" 
+            identityModule.callAttr("get_fingerprint", key).toString()
         }
     }
 
-    fun processScannedQr(qrData: String) {
+    fun processScannedQr(qrData: String, onAnswerReady: ((String) -> Unit)? = null) {
         try {
             val result = identityModule.callAttr("parse_qr_data", qrData)
             val peerUsername = result.asList()[0].toString()
             val peerIdentityKey = result.asList()[1].toJava(ByteArray::class.java)
             val timestamp = result.asList()[2].toLong()
+            val sdp = result.asList()[3]?.toString()
+            val sdpTypeStr = result.asList()[4]?.toString()
             
             val existing = trustedPeers[peerUsername]
             if (existing != null && !existing.publicKey.contentEquals(peerIdentityKey)) {
                 Log.e(TAG, "SECURITY ALERT: Scanned key for $peerUsername does not match trusted key!")
-                Toast.makeText(context, "Security Alert: Identity conflict for $peerUsername!", Toast.LENGTH_LONG).show()
                 return
             }
 
             trustedPeers[peerUsername] = PeerIdentity(peerIdentityKey, timestamp)
-            Toast.makeText(context, "Trusted $peerUsername (Created: $timestamp)", Toast.LENGTH_SHORT).show()
+            
+            if (sdp != null && sdpTypeStr != null) {
+                val type = if (sdpTypeStr == "offer") SessionDescription.Type.OFFER else SessionDescription.Type.ANSWER
+                handleRemoteSdp(sdp, type) { answerSdp ->
+                    val answerQr = identity?.callAttr("get_connection_qr", myUsername, answerSdp, "answer").toString()
+                    onAnswerReady?.invoke(answerQr)
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to parse QR data", e)
         }
@@ -268,6 +316,11 @@ class WebRTCManager(
     }
 
     private fun completeHandshake(peerUsername: String, peerPubKey: ByteArray, signature: ByteArray, idKey: ByteArray) {
+        if (session != null) {
+            Log.d(TAG, "Session already established with $peerUsername, ignoring redundant handshake.")
+            return
+        }
+
         val isValid = identityModule.callAttr("verify_signature", idKey, signature, peerPubKey).toBoolean()
         if (!isValid) {
             Log.e(TAG, "Handshake verification failed for $peerUsername")
@@ -275,12 +328,14 @@ class WebRTCManager(
         }
 
         if (ephemeralPrivateKey == null) {
-            sendHandshake() // Respond with our own handshake if we haven't sent one
+            Log.d(TAG, "Received handshake first, sending ours in response.")
+            sendHandshake()
         }
 
         val sharedKey = handshakeModule.callAttr("derive_shared", ephemeralPrivateKey, peerPubKey).toJava(ByteArray::class.java)
         session = sessionModule.get("Session")?.call(sharedKey)
         Log.d(TAG, "Session established with $peerUsername")
+        onStateChanged?.invoke("Secure Session Ready")
     }
 
     // --- Transport Layer ---
@@ -314,6 +369,7 @@ class WebRTCManager(
         try {
             val decrypted = session?.callAttr("decrypt", data).toString()
             Log.d(TAG, "Received: $decrypted")
+            onMessageReceived?.invoke(decrypted)
         } catch (e: Exception) {
             Log.e(TAG, "Decryption failed", e)
         }

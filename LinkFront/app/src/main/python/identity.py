@@ -45,6 +45,17 @@ class Identity:
         }
         return json.dumps(data)
 
+    def get_connection_qr(self, username, sdp, sdp_type):
+        """Creates a QR string containing identity AND WebRTC signaling data."""
+        data = {
+            "u": username,
+            "k": base64.b64encode(bytes(self.verify_key)).decode('utf-8'),
+            "t": self.created_at,
+            "s": sdp,
+            "st": sdp_type # "offer" or "answer"
+        }
+        return json.dumps(data)
+
 def get_fingerprint(pub_key_bytes):
     import hashlib
     if not isinstance(pub_key_bytes, (bytes, bytearray)):
@@ -63,4 +74,11 @@ def verify_signature(pub_key_bytes, signature, message_bytes):
 
 def parse_qr_data(qr_string):
     data = json.loads(qr_string)
-    return data["u"], base64.b64decode(data["k"]), data.get("t", 0)
+    # Return as a tuple: (username, key_bytes, timestamp, sdp, sdp_type)
+    return (
+        data["u"], 
+        base64.b64decode(data["k"]), 
+        data.get("t", 0),
+        data.get("s"),    # Optional SDP
+        data.get("st")    # Optional SDP type
+    )
