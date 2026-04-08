@@ -15,9 +15,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -25,12 +27,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -116,6 +121,31 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun HomeScreen(onNewConnection: () -> Unit, onChatSelected: () -> Unit) {
         val contactList by peerDao.getAllPeers().collectAsState(initial = emptyList())
+        var peerToDelete by remember { mutableStateOf<PeerEntity?>(null) }
+        val scope = rememberCoroutineScope()
+
+        if (peerToDelete != null) {
+            AlertDialog(
+                onDismissRequest = { peerToDelete = null },
+                title = { Text("Delete Connection?") },
+                text = { Text("Are you sure you want to remove ${peerToDelete?.username}? This will delete your shared history and trust.") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val peer = peerToDelete
+                            if (peer != null) {
+                                scope.launch { peerDao.delete(peer) }
+                            }
+                            peerToDelete = null
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) { Text("Delete") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { peerToDelete = null }) { Text("Cancel") }
+                }
+            )
+        }
 
         Scaffold(
             topBar = {
@@ -139,7 +169,17 @@ class MainActivity : ComponentActivity() {
                     ListItem(
                         headlineContent = { Text(peer.username) },
                         supportingContent = { Text("Fingerprint: ${peer.fingerprint.take(16)}...") },
-                        modifier = Modifier.clickable { onChatSelected() }
+                        trailingContent = {
+                            IconButton(onClick = { peerToDelete = peer }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                            }
+                        },
+                        modifier = Modifier.pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = { onChatSelected() },
+                                onLongPress = { peerToDelete = peer }
+                            )
+                        }
                     )
                 }
             }
@@ -255,13 +295,22 @@ class MainActivity : ComponentActivity() {
     fun ChatScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
         var textInput by remember { mutableStateOf("") }
         val messages by messageDao.getAllMessages().collectAsState(initial = emptyList())
+        val listState = rememberLazyListState()
+
+        // Auto-scroll to bottom when new messages arrive
+        LaunchedEffect(messages.size) {
+            if (messages.isNotEmpty()) {
+                listState.animateScrollToItem(messages.size - 1)
+            }
+        }
 
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = {
                         Column {
-                            Text("Secure Chat", style = MaterialTheme.typography.titleMedium)
+                            val title = if (webrtcManager != null) "Chat with ${webrtcManager.peerUsername}" else "Secure Chat"
+                            Text(title, style = MaterialTheme.typography.titleMedium)
                             Text(connectionState, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                         }
                     },
@@ -297,6 +346,7 @@ class MainActivity : ComponentActivity() {
             }
         ) { innerPadding ->
             LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize()

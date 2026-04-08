@@ -14,6 +14,9 @@ interface PeerDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(peer: PeerEntity)
 
+    @androidx.room.Delete
+    suspend fun delete(peer: PeerEntity)
+
     @Query("SELECT * FROM peers WHERE fingerprint = :fingerprint")
     suspend fun getPeerByFingerprint(fingerprint: String): PeerEntity?
 

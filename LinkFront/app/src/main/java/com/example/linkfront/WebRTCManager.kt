@@ -7,6 +7,9 @@ import android.util.Log
 import android.widget.Toast
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,6 +46,8 @@ class WebRTCManager(
 
     private var ephemeralPrivateKey: ByteArray? = null
     private var ephemeralPublicKey: ByteArray? = null
+    var peerUsername: String by mutableStateOf("Waiting for peer...")
+        private set
     private var session: PyObject? = null
     private var onIceGatheringComplete: ((String) -> Unit)? = null
     private val gatheringHandler = Handler(Looper.getMainLooper())
@@ -292,6 +297,7 @@ class WebRTCManager(
 
     private fun handleHandshake(json: JSONObject) {
         val peerUsername = json.getString("username")
+        this.peerUsername = peerUsername
         val peerPubKey = android.util.Base64.decode(json.getString("pubkey"), android.util.Base64.DEFAULT)
         val signature = android.util.Base64.decode(json.getString("signature"), android.util.Base64.DEFAULT)
         val peerIdKey = android.util.Base64.decode(json.getString("identity_key"), android.util.Base64.DEFAULT)
