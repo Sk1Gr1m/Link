@@ -7,6 +7,9 @@ import android.util.Log
 import android.widget.Toast
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import org.webrtc.*
 import java.nio.ByteBuffer
@@ -14,11 +17,14 @@ import java.nio.charset.StandardCharsets
 
 class WebRTCManager(
     private val context: Context,
+    private val messageDao: MessageDao,
+    private val peerDao: PeerDao,
     private val onConnectionRequest: (String, String, ByteArray, (Boolean) -> Unit) -> Unit,
     var onMessageReceived: ((String) -> Unit)? = null,
     var onStateChanged: ((String) -> Unit)? = null
 ) {
     private val TAG = "WebRTCManager"
+    private val scope = CoroutineScope(Dispatchers.IO)
     private val peerConnectionFactory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
     private var dataChannel: DataChannel? = null
@@ -305,6 +311,10 @@ class WebRTCManager(
             val fingerprint = identityModule.callAttr("get_fingerprint", peerIdKey).toString()
             onConnectionRequest(peerUsername, "$fingerprint (TS: $peerTimestamp)", peerIdKey) { accepted ->
                 if (accepted) {
+                    val fingerprint = identityModule.callAttr("get_fingerprint", peerIdKey).toString()
+                    scope.launch {
+                        peerDao.insert(PeerEntity(fingerprint, peerUsername, peerIdKey))
+                    }
                     trustedPeers[peerUsername] = PeerIdentity(peerIdKey, peerTimestamp)
                     completeHandshake(peerUsername, peerPubKey, signature, peerIdKey)
                 } else {
@@ -345,6 +355,9 @@ class WebRTCManager(
             val encrypted = session?.callAttr("encrypt", message)?.toJava(ByteArray::class.java)
             if (encrypted != null) {
                 dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
+                scope.launch {
+                    messageDao.insert(MessageEntity(text = message, isMe = true))
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Send failed", e)
@@ -369,6 +382,9 @@ class WebRTCManager(
         try {
             val decrypted = session?.callAttr("decrypt", data).toString()
             Log.d(TAG, "Received: $decrypted")
+            scope.launch {
+                messageDao.insert(MessageEntity(text = decrypted, isMe = false))
+            }
             onMessageReceived?.invoke(decrypted)
         } catch (e: Exception) {
             Log.e(TAG, "Decryption failed", e)

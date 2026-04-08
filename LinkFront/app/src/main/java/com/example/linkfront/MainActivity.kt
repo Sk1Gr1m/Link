@@ -14,6 +14,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -21,15 +22,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import com.example.linkfront.ui.theme.LinkFrontTheme
@@ -37,16 +42,15 @@ import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeEncoder
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
-import org.webrtc.SessionDescription
 
 class MainActivity : ComponentActivity() {
     
     private var webrtcManager by mutableStateOf<WebRTCManager?>(null)
     private var pendingRequest by mutableStateOf<PairingRequest?>(null)
-    private val messages = mutableStateListOf<Message>()
     private var connectionState by mutableStateOf("Disconnected")
-
-    data class Message(val text: String, val isMe: Boolean)
+    private lateinit var database: AppDatabase
+    private lateinit var messageDao: MessageDao
+    private lateinit var peerDao: PeerDao
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -64,6 +68,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
+        database = AppDatabase.getDatabase(this)
+        messageDao = database.messageDao()
+        peerDao = database.peerDao()
+
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(this))
         }
@@ -80,21 +88,67 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun MainScreen(webrtcManager: WebRTCManager?) {
-        var showChat by remember { mutableStateOf(false) }
+        val navController = rememberNavController()
 
         if (connectionState == "Secure Session Ready") {
-            showChat = true
+            LaunchedEffect(Unit) {
+                navController.navigate("chat")
+            }
         }
 
-        if (showChat) {
-            ChatScreen(webrtcManager)
-        } else {
-            PairingScreen(webrtcManager)
+        NavHost(navController = navController, startDestination = "home") {
+            composable("home") {
+                HomeScreen(
+                    onNewConnection = { navController.navigate("pairing") },
+                    onChatSelected = { navController.navigate("chat") }
+                )
+            }
+            composable("pairing") {
+                PairingScreen(webrtcManager, onBack = { navController.popBackStack() })
+            }
+            composable("chat") {
+                ChatScreen(webrtcManager, onBack = { navController.popBackStack() })
+            }
         }
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    fun PairingScreen(webrtcManager: WebRTCManager?) {
+    fun HomeScreen(onNewConnection: () -> Unit, onChatSelected: () -> Unit) {
+        val contactList by peerDao.getAllPeers().collectAsState(initial = emptyList())
+
+        Scaffold(
+            topBar = {
+                TopAppBar(title = { Text("Link") })
+            },
+            floatingActionButton = {
+                FloatingActionButton(onClick = onNewConnection) {
+                    Icon(Icons.Default.Add, contentDescription = "New Connection")
+                }
+            }
+        ) { innerPadding ->
+            LazyColumn(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+                if (contactList.isEmpty()) {
+                    item {
+                        Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("No contacts yet. Tap + to connect!", style = MaterialTheme.typography.bodyLarge)
+                        }
+                    }
+                }
+                items(contactList) { peer ->
+                    ListItem(
+                        headlineContent = { Text(peer.username) },
+                        supportingContent = { Text("Fingerprint: ${peer.fingerprint.take(16)}...") },
+                        modifier = Modifier.clickable { onChatSelected() }
+                    )
+                }
+            }
+        }
+    }
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    fun PairingScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
         var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
         val scrollState = rememberScrollState()
 
@@ -127,7 +181,18 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Connect to Peer") },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                )
+            }
+        ) { innerPadding ->
             Column(
                 modifier = Modifier
                     .padding(innerPadding)
@@ -136,18 +201,31 @@ class MainActivity : ComponentActivity() {
                     .verticalScroll(scrollState),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text(text = "Link P2P Signaling", style = MaterialTheme.typography.headlineMedium)
-                Text(text = "State: $connectionState", color = MaterialTheme.colorScheme.primary)
-                
-                Spacer(modifier = Modifier.height(16.dp))
-
                 if (qrBitmap != null) {
+                    Text("Your Connection QR", style = MaterialTheme.typography.titleMedium)
+                    Spacer(modifier = Modifier.height(8.dp))
                     Image(
                         bitmap = qrBitmap!!.asImageBitmap(),
                         contentDescription = "Connection QR",
                         modifier = Modifier.size(300.dp)
                     )
+                    Text(
+                        text = "Show this to your peer",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(300.dp)
+                            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("No QR Generated", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
+                
+                Spacer(modifier = Modifier.height(24.dp))
 
                 Button(
                     onClick = {
@@ -159,7 +237,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("1. Generate Offer QR") }
 
-                Button(
+                OutlinedButton(
                     onClick = {
                         val options = ScanOptions()
                         options.setDesiredBarcodeFormats(ScanOptions.QR_CODE)
@@ -172,11 +250,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    fun ChatScreen(webrtcManager: WebRTCManager?) {
+    fun ChatScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
         var textInput by remember { mutableStateOf("") }
+        val messages by messageDao.getAllMessages().collectAsState(initial = emptyList())
 
         Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text("Secure Chat", style = MaterialTheme.typography.titleMedium)
+                            Text(connectionState, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                )
+            },
             bottomBar = {
                 Row(
                     modifier = Modifier
@@ -193,11 +288,10 @@ class MainActivity : ComponentActivity() {
                     IconButton(onClick = {
                         if (textInput.isNotBlank()) {
                             webrtcManager?.sendEncrypted(textInput)
-                            messages.add(Message(textInput, true))
                             textInput = ""
                         }
                     }) {
-                        Icon(Icons.Default.Send, contentDescription = "Send")
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                     }
                 }
             }
@@ -217,7 +311,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun ChatBubble(message: Message) {
+    fun ChatBubble(message: MessageEntity) {
         val alignment = if (message.isMe) Alignment.CenterEnd else Alignment.CenterStart
         val color = if (message.isMe) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer
 
@@ -234,12 +328,6 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
-    }
-
-    private fun copyToClipboard(label: String, text: String) {
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = android.content.ClipData.newPlainText(label, text)
-        clipboard.setPrimaryClip(clip)
     }
 
     private fun checkAndRequestPermissions() {
@@ -259,10 +347,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initWebRTC() {
-        webrtcManager = WebRTCManager(this, { username, fingerprint, idKey, callback ->
+        webrtcManager = WebRTCManager(this, messageDao, peerDao, { username, fingerprint, idKey, callback ->
             pendingRequest = PairingRequest(username, fingerprint, idKey, callback)
-        }, { msg ->
-            runOnUiThread { messages.add(Message(msg, false)) }
+        }, { _ ->
+            // UI updates automatically via Room Flow
         }, { state ->
             runOnUiThread { connectionState = state }
         })
