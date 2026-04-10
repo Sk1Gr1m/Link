@@ -26,12 +26,15 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
@@ -97,29 +100,36 @@ class MainActivity : ComponentActivity() {
 
         if (connectionState == "Secure Session Ready") {
             LaunchedEffect(Unit) {
-                navController.navigate("chat")
+                // Only auto-navigate if we aren't already in a chat
+                if (navController.currentDestination?.route?.startsWith("chat") != true) {
+                    navController.navigate("chat/${webrtcManager?.peerFingerprint}")
+                }
             }
         }
 
         NavHost(navController = navController, startDestination = "home") {
             composable("home") {
                 HomeScreen(
-                    onNewConnection = { navController.navigate("pairing") },
-                    onChatSelected = { navController.navigate("chat") }
+                    onNewConnection = { navController.navigate("profile") },
+                    onChatSelected = { fingerprint ->
+                        navController.navigate("chat/$fingerprint")
+                    },
+                    onProfileClick = { navController.navigate("profile") }
                 )
             }
-            composable("pairing") {
-                PairingScreen(webrtcManager, onBack = { navController.popBackStack() })
+            composable("profile") {
+                ProfileScreen(webrtcManager, onBack = { navController.popBackStack() })
             }
-            composable("chat") {
-                ChatScreen(webrtcManager, onBack = { navController.popBackStack() })
+            composable("chat/{fingerprint}") { backStackEntry ->
+                val fingerprint = backStackEntry.arguments?.getString("fingerprint") ?: ""
+                ChatScreen(webrtcManager, fingerprint, onBack = { navController.popBackStack() })
             }
         }
     }
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    fun HomeScreen(onNewConnection: () -> Unit, onChatSelected: () -> Unit) {
+    fun HomeScreen(onNewConnection: () -> Unit, onChatSelected: (String) -> Unit, onProfileClick: () -> Unit) {
         val contactList by peerDao.getAllPeers().collectAsState(initial = emptyList())
         var peerToDelete by remember { mutableStateOf<PeerEntity?>(null) }
         val scope = rememberCoroutineScope()
@@ -149,7 +159,14 @@ class MainActivity : ComponentActivity() {
 
         Scaffold(
             topBar = {
-                TopAppBar(title = { Text("Link") })
+                TopAppBar(
+                    title = { Text("Link") },
+                    actions = {
+                        IconButton(onClick = onProfileClick) {
+                            Icon(Icons.Default.AccountCircle, contentDescription = "Profile")
+                        }
+                    }
+                )
             },
             floatingActionButton = {
                 FloatingActionButton(onClick = onNewConnection) {
@@ -176,7 +193,7 @@ class MainActivity : ComponentActivity() {
                         },
                         modifier = Modifier.pointerInput(Unit) {
                             detectTapGestures(
-                                onTap = { onChatSelected() },
+                                onTap = { onChatSelected(peer.fingerprint) },
                                 onLongPress = { peerToDelete = peer }
                             )
                         }
@@ -188,7 +205,8 @@ class MainActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    fun PairingScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
+    fun ProfileScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
+        var tempUsername by remember { mutableStateOf(webrtcManager?.myUsername ?: "") }
         var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
         val scrollState = rememberScrollState()
 
@@ -224,7 +242,7 @@ class MainActivity : ComponentActivity() {
         Scaffold(
             topBar = {
                 TopAppBar(
-                    title = { Text("Connect to Peer") },
+                    title = { Text("My Profile") },
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -241,23 +259,51 @@ class MainActivity : ComponentActivity() {
                     .verticalScroll(scrollState),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                Icon(
+                    Icons.Default.AccountCircle,
+                    contentDescription = null,
+                    modifier = Modifier.size(100.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+
+                OutlinedTextField(
+                    value = tempUsername,
+                    onValueChange = { tempUsername = it },
+                    label = { Text("Your Username") },
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = {
+                        if (tempUsername != webrtcManager?.myUsername) {
+                            TextButton(onClick = { webrtcManager?.updateUsername(tempUsername) }) {
+                                Text("Save")
+                            }
+                        }
+                    }
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Text(
+                    text = "Fingerprint: ${webrtcManager?.getFingerprint() ?: "Unknown"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
+
                 if (qrBitmap != null) {
-                    Text("Your Connection QR", style = MaterialTheme.typography.titleMedium)
+                    Text("Connection QR", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
                     Image(
                         bitmap = qrBitmap!!.asImageBitmap(),
                         contentDescription = "Connection QR",
                         modifier = Modifier.size(300.dp)
                     )
-                    Text(
-                        text = "Show this to your peer",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.secondary
-                    )
                 } else {
                     Box(
                         modifier = Modifier
-                            .size(300.dp)
+                            .size(250.dp)
                             .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp)),
                         contentAlignment = Alignment.Center
                     ) {
@@ -292,10 +338,18 @@ class MainActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    fun ChatScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
+    fun ChatScreen(webrtcManager: WebRTCManager?, fingerprint: String, onBack: () -> Unit) {
         var textInput by remember { mutableStateOf("") }
-        val messages by messageDao.getAllMessages().collectAsState(initial = emptyList())
+        val messages by messageDao.getMessagesForPeer(fingerprint).collectAsState(initial = emptyList())
         val listState = rememberLazyListState()
+        
+        // Auto-reconnect if disconnected with a retry loop
+        LaunchedEffect(webrtcManager?.connectionStatus) {
+            while (webrtcManager?.connectionStatus == "Disconnected") {
+                webrtcManager.connectToPeerViaDHT(fingerprint)
+                kotlinx.coroutines.delay(30000) // Retry every 30 seconds
+            }
+        }
 
         // Auto-scroll to bottom when new messages arrive
         LaunchedEffect(messages.size) {
@@ -310,8 +364,13 @@ class MainActivity : ComponentActivity() {
                     title = {
                         Column {
                             val title = if (webrtcManager != null) "Chat with ${webrtcManager.peerUsername}" else "Secure Chat"
+                            val status = webrtcManager?.connectionStatus ?: "Offline"
                             Text(title, style = MaterialTheme.typography.titleMedium)
-                            Text(connectionState, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                            Text(
+                                text = status,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (status == "Connected") Color(0xFF4CAF50) else MaterialTheme.colorScheme.secondary
+                            )
                         }
                     },
                     navigationIcon = {

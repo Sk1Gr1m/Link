@@ -4,12 +4,11 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.widget.Toast
-import com.chaquo.python.PyObject
-import com.chaquo.python.Python
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.chaquo.python.PyObject
+import com.chaquo.python.Python
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -36,17 +35,31 @@ class WebRTCManager(
     private val handshakeModule = py.getModule("handshake")
     private val sessionModule = py.getModule("session")
     private val identityModule = py.getModule("identity")
+    private val dhtModule = py.getModule("dht_node")
 
     private var identity: PyObject? = null
-    private var myUsername: String = "User_" + (100..999).random()
+    var myUsername by mutableStateOf("")
+        private set
 
-    // Store scanned peers: Map<Username, PeerIdentity>
+    private var signalServerSocket: java.net.ServerSocket? = null
+    private var signalPort: Int = 0
+
+    fun updateUsername(newName: String) {
+        myUsername = newName
+        context.getSharedPreferences("link_identity", Context.MODE_PRIVATE)
+            .edit().putString("my_username", newName).apply()
+    }
+
     data class PeerIdentity(val publicKey: ByteArray, val createdAt: Long)
     private val trustedPeers = mutableMapOf<String, PeerIdentity>()
 
     private var ephemeralPrivateKey: ByteArray? = null
     private var ephemeralPublicKey: ByteArray? = null
     var peerUsername: String by mutableStateOf("Waiting for peer...")
+        private set
+    var peerFingerprint: String? by mutableStateOf(null)
+        private set
+    var connectionStatus by mutableStateOf("Disconnected")
         private set
     private var session: PyObject? = null
     private var onIceGatheringComplete: ((String) -> Unit)? = null
@@ -67,7 +80,6 @@ class WebRTCManager(
     }
 
     private fun thinSdp(sdp: String): String {
-        // Removes unnecessary lines to make the QR code smaller
         return sdp.split("\n").filter { line ->
             !line.startsWith("a=extmap:") &&
             !line.startsWith("a=rtcp-fb:") &&
@@ -88,19 +100,20 @@ class WebRTCManager(
         if (savedSeedBase64 != null && savedTimestamp != -1L) {
             val seed = android.util.Base64.decode(savedSeedBase64, android.util.Base64.DEFAULT)
             identity = identityModule.get("Identity")?.call(seed, savedTimestamp)
-            Log.d(TAG, "Loaded existing identity from storage")
+            myUsername = prefs.getString("my_username", "User_" + (100..999).random())!!
         } else {
             identity = identityModule.get("Identity")?.call()
             val seed = identity?.callAttr("get_seed_bytes")?.toJava(ByteArray::class.java)
             val timestamp = identity?.callAttr("get_created_at")?.toLong() ?: 0L
+            myUsername = "User_" + (100..999).random()
             
             if (seed != null) {
                 val seedBase64 = android.util.Base64.encodeToString(seed, android.util.Base64.NO_WRAP)
                 prefs.edit()
                     .putString("identity_seed", seedBase64)
                     .putLong("identity_timestamp", timestamp)
+                    .putString("my_username", myUsername)
                     .apply()
-                Log.d(TAG, "Generated and saved new identity")
             }
         }
 
@@ -118,8 +131,118 @@ class WebRTCManager(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers)
-
         peerConnection = createPeerConnection(rtcConfig)
+
+        startSignalListener()
+        publishMyAddress()
+
+        scope.launch {
+            peerDao.getAllPeers().collect { peers ->
+                peers.forEach { peer ->
+                    trustedPeers[peer.username] = PeerIdentity(peer.identityKey, 0L)
+                }
+            }
+        }
+    }
+
+    private fun startSignalListener() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                signalServerSocket = java.net.ServerSocket(0)
+                signalPort = signalServerSocket!!.localPort
+                Log.d(TAG, "Signal Listener started on port $signalPort")
+                
+                while (true) {
+                    val client = signalServerSocket?.accept() ?: break
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val input = client.getInputStream().bufferedReader().readText()
+                            val json = JSONObject(input)
+                            val sdp = json.getString("sdp")
+                            val type = json.getString("type")
+                            
+                            if (type == "offer") {
+                                handleRemoteSdp(sdp, SessionDescription.Type.OFFER) { answer ->
+                                    val response = JSONObject()
+                                    response.put("type", "answer")
+                                    response.put("sdp", answer)
+                                    client.getOutputStream().write(response.toString().toByteArray())
+                                    client.getOutputStream().flush()
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Signal handling error: ${e.message}")
+                        } finally {
+                            client.close()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Signal Listener error: ${e.message}")
+            }
+        }
+    }
+
+    private fun publishMyAddress() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val publicIp = dhtModule.callAttr("get_public_ip")?.toString()
+                val myPublicKey = identity?.callAttr("get_public_key")?.toJava(ByteArray::class.java)
+                val fingerprint = getFingerprint(myPublicKey)
+                
+                if (publicIp != null && fingerprint != null) {
+                    Log.d(TAG, "Publishing to DHT: $fingerprint at $publicIp:$signalPort")
+                    dhtModule.callAttr("publish_address", fingerprint, publicIp, signalPort)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "DHT Publish error: ${e.message}")
+            }
+        }
+    }
+
+    fun connectToPeerViaDHT(fingerprint: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val result = dhtModule.callAttr("lookup_address", fingerprint)
+                if (result != null) {
+                    val ip = result.asMap()["ip"]?.toString()
+                    val port = result.asMap()["port"]?.toInt()
+                    
+                    if (ip != null && port != null) {
+                        Log.d(TAG, "Peer found at $ip:$port. Initiating...")
+                        createOffer { offerSdp ->
+                            sendOfferToAddress(ip, port, offerSdp)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "DHT Connect error: ${e.message}")
+            }
+        }
+    }
+
+    private fun sendOfferToAddress(ip: String, port: Int, sdp: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val socket = java.net.Socket(ip, port)
+                val request = JSONObject()
+                request.put("type", "offer")
+                request.put("sdp", sdp)
+                
+                socket.getOutputStream().write(request.toString().toByteArray())
+                socket.getOutputStream().flush()
+                
+                val responseText = socket.getInputStream().bufferedReader().readText()
+                val responseJson = JSONObject(responseText)
+                val answerSdp = responseJson.getString("sdp")
+                
+                handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                socket.close()
+                Log.d(TAG, "Connection via DHT established")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send offer to $ip:$port : ${e.message}")
+            }
+        }
     }
 
     private fun createPeerConnection(config: PeerConnection.RTCConfiguration): PeerConnection? {
@@ -127,23 +250,24 @@ class WebRTCManager(
             override fun onIceCandidate(candidate: IceCandidate) {
                 Log.d(TAG, "New ICE Candidate: $candidate")
             }
-
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-                Log.d(TAG, "ICE Gathering State: $state")
-                if (state == PeerConnection.IceGatheringState.COMPLETE) {
-                    finishGathering()
-                }
+                if (state == PeerConnection.IceGatheringState.COMPLETE) finishGathering()
             }
-
             override fun onSignalingChange(state: PeerConnection.SignalingState) {}
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                Log.d(TAG, "ICE Connection State: $state")
+                connectionStatus = when(state) {
+                    PeerConnection.IceConnectionState.CONNECTED,
+                    PeerConnection.IceConnectionState.COMPLETED -> "Verifying..."
+                    PeerConnection.IceConnectionState.DISCONNECTED -> "Reconnecting..."
+                    PeerConnection.IceConnectionState.FAILED,
+                    PeerConnection.IceConnectionState.CLOSED -> "Disconnected"
+                    else -> state.name
+                }
                 onStateChanged?.invoke("ICE: $state")
             }
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>) {}
             override fun onDataChannel(channel: DataChannel) {
-                Log.d(TAG, "Received remote DataChannel: ${channel.label()}")
                 setupDataChannel(channel)
             }
             override fun onAddStream(p0: MediaStream) {}
@@ -158,9 +282,11 @@ class WebRTCManager(
         dataChannel?.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(p0: Long) {}
             override fun onStateChange() {
-                Log.d(TAG, "DataChannel State: ${dataChannel?.state()}")
-                if (dataChannel?.state() == DataChannel.State.OPEN) {
+                val state = dataChannel?.state()
+                if (state == DataChannel.State.OPEN) {
                     sendHandshake()
+                } else if (state == DataChannel.State.CLOSED || state == DataChannel.State.CLOSING) {
+                    connectionStatus = "Disconnected"
                 }
             }
             override fun onMessage(buffer: DataChannel.Buffer) {
@@ -172,20 +298,13 @@ class WebRTCManager(
     fun initDataChannel() {
         val init = DataChannel.Init()
         val channel = peerConnection?.createDataChannel("chat", init)
-        if (channel != null) {
-            setupDataChannel(channel)
-        }
+        if (channel != null) setupDataChannel(channel)
     }
-
-    // --- Signaling Layer ---
 
     fun createOffer(callback: (String) -> Unit) {
         onIceGatheringComplete = callback
         initDataChannel()
-        
-        // Start a 3-second timeout. If gathering isn't complete by then, we just use what we have.
         gatheringHandler.postDelayed(gatheringTimeoutRunnable, 3000)
-
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 peerConnection?.setLocalDescription(SimpleSdpObserver(), sdp)
@@ -199,7 +318,6 @@ class WebRTCManager(
             override fun onSetSuccess() {
                 if (type == SessionDescription.Type.OFFER) {
                     onIceGatheringComplete = onAnswerReady
-                    // Start a 3-second timeout for the Answer gathering
                     gatheringHandler.postDelayed(gatheringTimeoutRunnable, 3000)
                     createAnswer()
                 }
@@ -214,8 +332,6 @@ class WebRTCManager(
             }
         }, MediaConstraints())
     }
-
-    // --- Identity & QR Logic ---
 
     fun getMyQrData(): String {
         return identity?.callAttr("get_qr_data", myUsername).toString()
@@ -246,10 +362,7 @@ class WebRTCManager(
             val sdpTypeStr = result.asList()[4]?.toString()
             
             val existing = trustedPeers[peerUsername]
-            if (existing != null && !existing.publicKey.contentEquals(peerIdentityKey)) {
-                Log.e(TAG, "SECURITY ALERT: Scanned key for $peerUsername does not match trusted key!")
-                return
-            }
+            if (existing != null && !existing.publicKey.contentEquals(peerIdentityKey)) return
 
             trustedPeers[peerUsername] = PeerIdentity(peerIdentityKey, timestamp)
             
@@ -265,8 +378,6 @@ class WebRTCManager(
         }
     }
 
-    // --- Handshake Layer ---
-
     private fun sendHandshake() {
         val result = handshakeModule.callAttr("generate_keypair")
         ephemeralPrivateKey = result.asList()[0].toJava(ByteArray::class.java)
@@ -275,24 +386,13 @@ class WebRTCManager(
         val json = JSONObject()
         json.put("type", "handshake")
         json.put("username", myUsername)
-        
-        val pubKeyBase64 = android.util.Base64.encodeToString(ephemeralPublicKey, android.util.Base64.NO_WRAP)
-        json.put("pubkey", pubKeyBase64)
-
-        val myIdKey = identity?.callAttr("get_public_key_bytes")?.toJava(ByteArray::class.java)
-        val myIdKeyBase64 = android.util.Base64.encodeToString(myIdKey, android.util.Base64.NO_WRAP)
-        json.put("identity_key", myIdKeyBase64)
-
-        val myTimestamp = identity?.callAttr("get_created_at")?.toLong() ?: 0L
-        json.put("timestamp", myTimestamp)
-
-        val signature = identity?.callAttr("sign", ephemeralPublicKey)?.toJava(ByteArray::class.java)
-        val sigBase64 = android.util.Base64.encodeToString(signature, android.util.Base64.NO_WRAP)
-        json.put("signature", sigBase64)
+        json.put("pubkey", android.util.Base64.encodeToString(ephemeralPublicKey, android.util.Base64.NO_WRAP))
+        json.put("identity_key", android.util.Base64.encodeToString(identity?.callAttr("get_public_key_bytes")?.toJava(ByteArray::class.java), android.util.Base64.NO_WRAP))
+        json.put("timestamp", identity?.callAttr("get_created_at")?.toLong() ?: 0L)
+        json.put("signature", android.util.Base64.encodeToString(identity?.callAttr("sign", ephemeralPublicKey)?.toJava(ByteArray::class.java), android.util.Base64.NO_WRAP))
 
         val packet = json.toString().toByteArray(StandardCharsets.UTF_8)
         dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(packet), false))
-        Log.d(TAG, "Sent handshake")
     }
 
     private fun handleHandshake(json: JSONObject) {
@@ -303,77 +403,54 @@ class WebRTCManager(
         val peerIdKey = android.util.Base64.decode(json.getString("identity_key"), android.util.Base64.DEFAULT)
         val peerTimestamp = json.optLong("timestamp", 0L)
 
+        val fingerprint = identityModule.callAttr("get_fingerprint", peerIdKey).toString()
+        this.peerFingerprint = fingerprint
         val trusted = trustedPeers[peerUsername]
 
         if (trusted != null) {
             if (!peerIdKey.contentEquals(trusted.publicKey)) {
-                Log.e(TAG, "SECURITY ALERT: Handshake identity for $peerUsername does not match trusted key!")
                 dataChannel?.close()
                 return
             }
             completeHandshake(peerUsername, peerPubKey, signature, trusted.publicKey)
         } else {
-            // Unknown peer - trigger TOFU dialog
-            val fingerprint = identityModule.callAttr("get_fingerprint", peerIdKey).toString()
             onConnectionRequest(peerUsername, "$fingerprint (TS: $peerTimestamp)", peerIdKey) { accepted ->
                 if (accepted) {
-                    val fingerprint = identityModule.callAttr("get_fingerprint", peerIdKey).toString()
-                    scope.launch {
-                        peerDao.insert(PeerEntity(fingerprint, peerUsername, peerIdKey))
-                    }
+                    val finger = identityModule.callAttr("get_fingerprint", peerIdKey).toString()
+                    scope.launch { peerDao.insert(PeerEntity(finger, peerUsername, peerIdKey)) }
                     trustedPeers[peerUsername] = PeerIdentity(peerIdKey, peerTimestamp)
                     completeHandshake(peerUsername, peerPubKey, signature, peerIdKey)
-                } else {
-                    Log.d(TAG, "Connection from $peerUsername rejected by user.")
-                    dataChannel?.close()
-                }
+                } else dataChannel?.close()
             }
         }
     }
 
     private fun completeHandshake(peerUsername: String, peerPubKey: ByteArray, signature: ByteArray, idKey: ByteArray) {
-        if (session != null) {
-            Log.d(TAG, "Session already established with $peerUsername, ignoring redundant handshake.")
-            return
-        }
-
+        if (session != null) return
         val isValid = identityModule.callAttr("verify_signature", idKey, signature, peerPubKey).toBoolean()
-        if (!isValid) {
-            Log.e(TAG, "Handshake verification failed for $peerUsername")
-            return
-        }
-
-        if (ephemeralPrivateKey == null) {
-            Log.d(TAG, "Received handshake first, sending ours in response.")
-            sendHandshake()
-        }
+        if (!isValid) return
+        if (ephemeralPrivateKey == null) sendHandshake()
 
         val sharedKey = handshakeModule.callAttr("derive_shared", ephemeralPrivateKey, peerPubKey).toJava(ByteArray::class.java)
         session = sessionModule.get("Session")?.call(sharedKey)
-        Log.d(TAG, "Session established with $peerUsername")
+        connectionStatus = "Connected"
         onStateChanged?.invoke("Secure Session Ready")
     }
-
-    // --- Transport Layer ---
 
     fun sendEncrypted(message: String) {
         try {
             val encrypted = session?.callAttr("encrypt", message)?.toJava(ByteArray::class.java)
-            if (encrypted != null) {
+            val currentFingerprint = peerFingerprint
+            if (encrypted != null && currentFingerprint != null) {
                 dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
-                scope.launch {
-                    messageDao.insert(MessageEntity(text = message, isMe = true))
-                }
+                scope.launch { messageDao.insert(MessageEntity(peerFingerprint = currentFingerprint, text = message, isMe = true)) }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Send failed", e)
-        }
+        } catch (e: Exception) { Log.e(TAG, "Send failed", e) }
     }
 
     private fun onReceive(buffer: DataChannel.Buffer) {
         val data = ByteArray(buffer.data.remaining())
         buffer.data.get(data)
-        
         try {
             val str = String(data, StandardCharsets.UTF_8)
             if (str.startsWith("{")) {
@@ -387,14 +464,12 @@ class WebRTCManager(
 
         try {
             val decrypted = session?.callAttr("decrypt", data).toString()
-            Log.d(TAG, "Received: $decrypted")
-            scope.launch {
-                messageDao.insert(MessageEntity(text = decrypted, isMe = false))
+            val currentFingerprint = peerFingerprint
+            if (currentFingerprint != null) {
+                scope.launch { messageDao.insert(MessageEntity(peerFingerprint = currentFingerprint, text = decrypted, isMe = false)) }
             }
             onMessageReceived?.invoke(decrypted)
-        } catch (e: Exception) {
-            Log.e(TAG, "Decryption failed", e)
-        }
+        } catch (e: Exception) { Log.e(TAG, "Decryption failed", e) }
     }
 }
 

@@ -56,6 +56,7 @@ chaquopy {
 
         pip {
             install("pynacl")
+            install("kademlia")
             install("qrcode")
             install("pillow")
             install("pytest")
