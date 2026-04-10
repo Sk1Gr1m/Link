@@ -454,13 +454,141 @@ class WebRTCManager(
                 Log.d(tag, "sendEncrypted: data encrypted, sending via DataChannel to $currentFingerprint")
                 dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
                 scope.launch { 
-                    messageDao.insert(MessageEntity(peerFingerprint = currentFingerprint, text = message, isMe = true))
+                    messageDao.insert(MessageEntity(peerFingerprint = currentFingerprint, text = message, isMe = true, messageType = "TEXT"))
                     Log.d(tag, "sendEncrypted: inserted into DB: $message")
                 }
             } else {
                 Log.w(tag, "sendEncrypted: session or fingerprint null. session=$session, fingerprint=$currentFingerprint")
             }
         } catch (_: Exception) { Log.e(tag, "Send failed") }
+    }
+
+    fun sendImage(imageBytes: ByteArray) {
+        val currentFingerprint = peerFingerprint
+        if (session == null || currentFingerprint == null) return
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                // 1. Create a local file to store the image
+                val fileName = "img_${System.currentTimeMillis()}.jpg"
+                val file = java.io.File(context.filesDir, fileName)
+                file.writeBytes(imageBytes)
+
+                // 2. Break into chunks and send
+                val chunkSize = 32 * 1024 // 32KB chunks
+                val totalChunks = (imageBytes.size + chunkSize - 1) / chunkSize
+                val transferId = System.currentTimeMillis().toString()
+
+                // 3. Save to DB with initial progress
+                val messageId = messageDao.insert(MessageEntity(
+                    peerFingerprint = currentFingerprint,
+                    text = "[Image]",
+                    isMe = true,
+                    messageType = "IMAGE",
+                    filePath = file.absolutePath,
+                    transferStatus = "PENDING",
+                    progress = 0
+                )).toInt()
+
+                for (i in 0 until totalChunks) {
+                    val start = i * chunkSize
+                    val end = minOf(start + chunkSize, imageBytes.size)
+                    val chunkData = imageBytes.copyOfRange(start, end)
+                    
+                    val packet = JSONObject()
+                    packet.put("type", "image_chunk")
+                    packet.put("id", transferId)
+                    packet.put("index", i)
+                    packet.put("total", totalChunks)
+                    packet.put("data", android.util.Base64.encodeToString(chunkData, android.util.Base64.NO_WRAP))
+
+                    val encrypted = session?.callAttr("encrypt", packet.toString())?.toJava(ByteArray::class.java)
+                    if (encrypted != null) {
+                        dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
+                        val currentProgress = ((i + 1) * 100) / totalChunks
+                        messageDao.updateTransferProgress(messageId, currentProgress, if (currentProgress == 100) "COMPLETED" else "PENDING", file.absolutePath)
+                    }
+                    // Small delay to prevent flooding the buffer
+                    kotlinx.coroutines.delay(20)
+                }
+            } catch (_: Exception) {
+                Log.e(tag, "Failed to send image")
+            }
+        }
+    }
+
+    private val incomingImages = mutableMapOf<String, MutableMap<Int, ByteArray>>()
+    private val incomingMessageIds = mutableMapOf<String, Long>()
+
+    private fun handleImageChunk(json: JSONObject) {
+        val transferId = json.getString("id")
+        val index = json.getInt("index")
+        val total = json.getInt("total")
+        val data = android.util.Base64.decode(json.getString("data"), android.util.Base64.DEFAULT)
+
+        val chunks = incomingImages.getOrPut(transferId) { mutableMapOf() }
+        chunks[index] = data
+
+        val currentFingerprint = peerFingerprint
+        if (currentFingerprint != null) {
+            val currentProgress = (chunks.size * 100) / total
+            scope.launch {
+                val existingId = incomingMessageIds[transferId]
+                if (existingId == null) {
+                    val fileName = "rcv_${transferId}.jpg"
+                    val file = java.io.File(context.filesDir, fileName)
+                    val newId = messageDao.insert(MessageEntity(
+                        peerFingerprint = currentFingerprint,
+                        text = "[Receiving Image...]",
+                        isMe = false,
+                        messageType = "IMAGE",
+                        filePath = file.absolutePath,
+                        transferStatus = "PENDING",
+                        progress = currentProgress
+                    ))
+                    incomingMessageIds[transferId] = newId
+                } else {
+                    val fileName = "rcv_${transferId}.jpg"
+                    val file = java.io.File(context.filesDir, fileName)
+                    messageDao.updateTransferProgress(existingId.toInt(), currentProgress, "PENDING", file.absolutePath)
+                }
+            }
+        }
+
+        if (chunks.size == total) {
+            // All chunks received, assemble image
+            val out = java.io.ByteArrayOutputStream()
+            for (i in 0 until total) {
+                out.write(chunks[i]!!)
+            }
+            val fullImage = out.toByteArray()
+            incomingImages.remove(transferId)
+
+            val fileName = "rcv_${System.currentTimeMillis()}.jpg"
+            val file = java.io.File(context.filesDir, fileName)
+            file.writeBytes(fullImage)
+
+            val currentFingerprint = peerFingerprint
+            if (currentFingerprint != null) {
+                scope.launch {
+                    val existingId = incomingMessageIds.remove(transferId)
+                    if (existingId != null) {
+                        messageDao.updateTransferProgress(existingId.toInt(), 100, "COMPLETED", file.absolutePath)
+                    } else {
+                        messageDao.insert(MessageEntity(
+                            peerFingerprint = currentFingerprint,
+                            text = "[Image]",
+                            isMe = false,
+                            messageType = "IMAGE",
+                            filePath = file.absolutePath,
+                            transferStatus = "COMPLETED",
+                            progress = 100
+                        ))
+                    }
+                    onMessageReceived?.invoke("[Image Received]")
+                }
+            }
+        }
     }
 
     private fun onReceive(buffer: DataChannel.Buffer) {
@@ -480,10 +608,19 @@ class WebRTCManager(
         try {
             val decrypted = session?.callAttr("decrypt", data).toString()
             Log.d(tag, "onReceive: decrypted text = '$decrypted'")
+            
+            if (decrypted.startsWith("{")) {
+                val json = JSONObject(decrypted)
+                if (json.optString("type") == "image_chunk") {
+                    handleImageChunk(json)
+                    return
+                }
+            }
+
             val currentFingerprint = peerFingerprint
             if (currentFingerprint != null) {
                 scope.launch { 
-                    messageDao.insert(MessageEntity(peerFingerprint = currentFingerprint, text = decrypted, isMe = false))
+                    messageDao.insert(MessageEntity(peerFingerprint = currentFingerprint, text = decrypted, isMe = false, messageType = "TEXT"))
                     Log.d(tag, "onReceive: inserted into DB: $decrypted")
                 }
             } else {

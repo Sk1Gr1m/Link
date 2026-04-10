@@ -11,7 +11,7 @@ interface MessageDao {
     fun getMessagesForPeer(fingerprint: String): Flow<List<MessageEntity>>
 
     @Insert
-    suspend fun insert(message: MessageEntity)
+    suspend fun insert(message: MessageEntity): Long
 
     @Query("DELETE FROM messages WHERE peerFingerprint = :fingerprint")
     suspend fun deleteMessagesForPeer(fingerprint: String)
@@ -21,4 +21,10 @@ interface MessageDao {
 
     @Query("DELETE FROM messages")
     suspend fun deleteAll()
+
+    @Query("UPDATE messages SET progress = :progress, transferStatus = :status, filePath = :filePath WHERE id = :id")
+    suspend fun updateTransferProgress(id: Int, progress: Int, status: String, filePath: String)
+
+    @Query("SELECT MAX(id) FROM messages")
+    suspend fun getLastInsertedId(): Int
 }

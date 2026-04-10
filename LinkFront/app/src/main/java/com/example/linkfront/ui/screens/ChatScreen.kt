@@ -1,7 +1,13 @@
 package com.example.linkfront.ui.screens
 
+import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -10,19 +16,24 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.example.linkfront.MessageDao
 import com.example.linkfront.MessageEntity
 import com.example.linkfront.WebRTCManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
@@ -47,7 +58,37 @@ fun ChatScreen(
     val sortedMessages = remember(messages) { messages.sortedByDescending { it.id } }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var messageToDelete by remember { mutableStateOf<MessageEntity?>(null) }
+    var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
+
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openInputStream(it)?.use { inputStream ->
+                        val bytes = inputStream.readBytes()
+                        if (fingerprint == "SELF") {
+                            val fileName = "img_${System.currentTimeMillis()}.jpg"
+                            val file = java.io.File(context.filesDir, fileName)
+                            file.writeBytes(bytes)
+                            messageDao.insert(MessageEntity(
+                                peerFingerprint = "SELF",
+                                text = "[Image]",
+                                isMe = true,
+                                messageType = "IMAGE",
+                                filePath = file.absolutePath
+                            ))
+                        } else {
+                            webrtcManager?.sendImage(bytes)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
 
     if (messageToDelete != null) {
         AlertDialog(
@@ -74,6 +115,39 @@ fun ChatScreen(
         )
     }
 
+    if (fullScreenImagePath != null) {
+        androidx.compose.ui.window.Dialog(
+            onDismissRequest = { fullScreenImagePath = null },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .pointerInput(Unit) {
+                        detectTapGestures(onTap = { fullScreenImagePath = null })
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                val bitmap = remember(fullScreenImagePath) {
+                    try {
+                        BitmapFactory.decodeFile(fullScreenImagePath)
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "Full Screen Image",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            }
+        }
+    }
+
     LaunchedEffect(webrtcManager?.connectionStatus, fingerprint) {
         if (fingerprint == "SELF") return@LaunchedEffect
         while (webrtcManager?.connectionStatus == "Disconnected") {
@@ -97,10 +171,11 @@ fun ChatScreen(
                 title = {
                     Column {
                         val title = if (fingerprint == "SELF") "My Notes"
-                                   else if (webrtcManager != null) "Chat with ${webrtcManager.peerUsername}"
+                                   else if (webrtcManager != null && webrtcManager.peerFingerprint == fingerprint) "Chat with ${webrtcManager.peerUsername}"
                                    else "Secure Chat"
                         val status = if (fingerprint == "SELF") "Local Only"
-                                    else webrtcManager?.connectionStatus ?: "Offline"
+                                    else if (webrtcManager != null && webrtcManager.peerFingerprint == fingerprint) webrtcManager.connectionStatus
+                                    else "Offline"
                         
                         Text(title, style = MaterialTheme.typography.titleMedium)
                         Text(
@@ -155,7 +230,8 @@ fun ChatScreen(
                 items(items = sortedMessages, key = { it.id }) { msg ->
                     ChatBubble(
                         message = msg,
-                        onLongClick = { messageToDelete = msg }
+                        onLongClick = { messageToDelete = msg },
+                        onImageClick = { fullScreenImagePath = it }
                     )
                 }
             }
@@ -171,6 +247,9 @@ fun ChatScreen(
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp).fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    IconButton(onClick = { imagePickerLauncher.launch("image/*") }) {
+                        Icon(Icons.Default.Add, contentDescription = "Attach Image")
+                    }
                     TextField(
                         value = textInput,
                         onValueChange = { textInput = it },
@@ -192,7 +271,8 @@ fun ChatScreen(
                                 val messageText = textInput
                                 if (fingerprint == "SELF") {
                                     scope.launch {
-                                        messageDao.insert(MessageEntity(peerFingerprint = "SELF", text = messageText, isMe = true))
+                                        val id = messageDao.insert(MessageEntity(peerFingerprint = "SELF", text = messageText, isMe = true))
+                                        println("Inserted message with ID: $id")
                                     }
                                 } else {
                                     webrtcManager?.sendEncrypted(messageText)
@@ -217,9 +297,10 @@ fun ChatScreen(
 @Composable
 fun ChatBubble(
     message: MessageEntity,
-    onLongClick: () -> Unit
+    onLongClick: () -> Unit,
+    onImageClick: (String) -> Unit
 ) {
-    if (message.text.isEmpty()) return
+    if (message.text.isEmpty() && message.messageType != "IMAGE") return
 
     val isMe = message.isMe
     val timeString = remember(message.timestamp) {
@@ -253,11 +334,55 @@ fun ChatBubble(
             modifier = Modifier.widthIn(max = 300.dp)
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = textColor
-                )
+                if (message.messageType == "IMAGE" && message.filePath != null) {
+                    val bitmap = remember(message.filePath) {
+                        try {
+                            BitmapFactory.decodeFile(message.filePath)
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    if (bitmap != null) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .padding(bottom = 4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.Black.copy(alpha = 0.1f))
+                                .clickable { message.filePath?.let { onImageClick(it) } }
+                        ) {
+                            Image(
+                                bitmap = bitmap.asImageBitmap(),
+                                contentDescription = "Image message",
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 400.dp),
+                                contentScale = ContentScale.Crop
+                            )
+                            if (message.transferStatus == "PENDING") {
+                                CircularProgressIndicator(
+                                    progress = { message.progress / 100f },
+                                    modifier = Modifier.size(48.dp),
+                                    color = Color.White
+                                )
+                            }
+                        }
+                    } else if (message.transferStatus == "PENDING") {
+                        CircularProgressIndicator(
+                            progress = { message.progress / 100f },
+                            modifier = Modifier.size(48.dp).padding(8.dp),
+                            color = textColor
+                        )
+                    } else {
+                        Text("[Image Error]", color = textColor)
+                    }
+                } else {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = textColor
+                    )
+                }
                 Text(
                     text = timeString,
                     style = MaterialTheme.typography.labelSmall,
