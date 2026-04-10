@@ -16,6 +16,9 @@ interface MessageDao {
     @Query("DELETE FROM messages WHERE peerFingerprint = :fingerprint")
     suspend fun deleteMessagesForPeer(fingerprint: String)
 
+    @Query("DELETE FROM messages WHERE id = :id")
+    suspend fun deleteMessageById(id: Int)
+
     @Query("DELETE FROM messages")
     suspend fun deleteAll()
 }
