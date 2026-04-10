@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -15,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -37,6 +39,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import androidx.core.content.ContextCompat
@@ -134,6 +138,10 @@ class MainActivity : ComponentActivity() {
         var peerToDelete by remember { mutableStateOf<PeerEntity?>(null) }
         val scope = rememberCoroutineScope()
 
+        val displayContacts = remember(contactList) {
+            listOf(PeerEntity("SELF", "My Notes", byteArrayOf())) + contactList
+        }
+
         if (peerToDelete != null) {
             AlertDialog(
                 onDismissRequest = { peerToDelete = null },
@@ -175,29 +183,35 @@ class MainActivity : ComponentActivity() {
             }
         ) { innerPadding ->
             LazyColumn(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
-                if (contactList.isEmpty()) {
-                    item {
-                        Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("No contacts yet. Tap + to connect!", style = MaterialTheme.typography.bodyLarge)
-                        }
-                    }
-                }
-                items(contactList) { peer ->
+                items(displayContacts) { peer ->
                     ListItem(
                         headlineContent = { Text(peer.username) },
-                        supportingContent = { Text("Fingerprint: ${peer.fingerprint.take(16)}...") },
+                        supportingContent = { 
+                            if (peer.fingerprint == "SELF") {
+                                Text("Private scratchpad", style = MaterialTheme.typography.bodySmall)
+                            } else {
+                                Text("Fingerprint: ${peer.fingerprint.take(16)}...")
+                            }
+                        },
+                        leadingContent = {
+                            val icon = if (peer.fingerprint == "SELF") Icons.Default.Settings else Icons.Default.AccountCircle
+                            Icon(icon, contentDescription = null)
+                        },
                         trailingContent = {
-                            IconButton(onClick = { peerToDelete = peer }) {
-                                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                            if (peer.fingerprint != "SELF") {
+                                IconButton(onClick = { peerToDelete = peer }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                                }
                             }
                         },
                         modifier = Modifier.pointerInput(Unit) {
                             detectTapGestures(
                                 onTap = { onChatSelected(peer.fingerprint) },
-                                onLongPress = { peerToDelete = peer }
+                                onLongPress = { if (peer.fingerprint != "SELF") peerToDelete = peer }
                             )
                         }
                     )
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                 }
             }
         }
@@ -336,40 +350,51 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @OptIn(ExperimentalMaterial3Api::class)
+    @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
     @Composable
     fun ChatScreen(webrtcManager: WebRTCManager?, fingerprint: String, onBack: () -> Unit) {
         var textInput by remember { mutableStateOf("") }
         val messages by messageDao.getMessagesForPeer(fingerprint).collectAsState(initial = emptyList())
+        val sortedMessages = remember(messages) { messages.sortedByDescending { it.id } }
         val listState = rememberLazyListState()
-        
+        val scope = rememberCoroutineScope()
+
         // Auto-reconnect if disconnected with a retry loop
-        LaunchedEffect(webrtcManager?.connectionStatus) {
+        LaunchedEffect(webrtcManager?.connectionStatus, fingerprint) {
+            if (fingerprint == "SELF") return@LaunchedEffect
+            
             while (webrtcManager?.connectionStatus == "Disconnected") {
-                webrtcManager.connectToPeerViaDHT(fingerprint)
-                kotlinx.coroutines.delay(30000) // Retry every 30 seconds
+                webrtcManager?.connectToPeerViaDHT(fingerprint)
+                kotlinx.coroutines.delay(30000) 
             }
         }
 
-        // Auto-scroll to bottom when new messages arrive
-        LaunchedEffect(messages.size) {
-            if (messages.isNotEmpty()) {
-                listState.animateScrollToItem(messages.size - 1)
+        // 1. Initial scroll to top (which is bottom in reversed layout) ONLY when the chat is opened
+        var initialScrollDone by remember(fingerprint) { mutableStateOf(false) }
+        LaunchedEffect(messages) {
+            if (messages.isNotEmpty() && !initialScrollDone) {
+                listState.scrollToItem(0)
+                initialScrollDone = true
             }
         }
 
         Scaffold(
+            modifier = Modifier.fillMaxSize(),
             topBar = {
                 TopAppBar(
                     title = {
                         Column {
-                            val title = if (webrtcManager != null) "Chat with ${webrtcManager.peerUsername}" else "Secure Chat"
-                            val status = webrtcManager?.connectionStatus ?: "Offline"
+                            val title = if (fingerprint == "SELF") "My Notes" 
+                                       else if (webrtcManager != null) "Chat with ${webrtcManager.peerUsername}" 
+                                       else "Secure Chat"
+                            val status = if (fingerprint == "SELF") "Local Only" 
+                                        else webrtcManager?.connectionStatus ?: "Offline"
+                            
                             Text(title, style = MaterialTheme.typography.titleMedium)
                             Text(
                                 text = status,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (status == "Connected") Color(0xFF4CAF50) else MaterialTheme.colorScheme.secondary
+                                color = if (status == "Connected" || status == "Local Only") Color(0xFF4CAF50) else MaterialTheme.colorScheme.secondary
                             )
                         }
                     },
@@ -377,43 +402,87 @@ class MainActivity : ComponentActivity() {
                         IconButton(onClick = onBack) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
-                    }
-                )
-            },
-            bottomBar = {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    TextField(
-                        value = textInput,
-                        onValueChange = { textInput = it },
-                        modifier = Modifier.weight(1f),
-                        placeholder = { Text("Encrypted message...") }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
                     )
-                    IconButton(onClick = {
-                        if (textInput.isNotBlank()) {
-                            webrtcManager?.sendEncrypted(textInput)
-                            textInput = ""
-                        }
-                    }) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
-                    }
-                }
+                )
             }
         ) { innerPadding ->
-            LazyColumn(
-                state = listState,
+            Column(
                 modifier = Modifier
-                    .padding(innerPadding)
                     .fillMaxSize()
-                    .padding(8.dp),
-                reverseLayout = false
+                    .padding(innerPadding)
+                    .background(MaterialTheme.colorScheme.surface)
             ) {
-                items(messages) { msg ->
-                    ChatBubble(msg)
+                LazyColumn(
+                    state = listState,
+                    reverseLayout = true,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom)
+                ) {
+                    items(
+                        items = sortedMessages,
+                        key = { it.id }
+                    ) { msg ->
+                        ChatBubble(msg)
+                    }
+                }
+
+                Surface(
+                    tonalElevation = 2.dp,
+                    shadowElevation = 8.dp,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .padding(horizontal = 4.dp, vertical = 4.dp)
+                            .fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextField(
+                            value = textInput,
+                            onValueChange = { textInput = it },
+                            modifier = Modifier.weight(1f),
+                            placeholder = { Text("Message...") },
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                disabledContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent,
+                            ),
+                            maxLines = 4
+                        )
+                        
+                        FloatingActionButton(
+                            onClick = {
+                                if (textInput.isNotBlank()) {
+                                    val messageText = textInput
+                                    if (fingerprint == "SELF") {
+                                        scope.launch {
+                                            messageDao.insert(MessageEntity(peerFingerprint = "SELF", text = messageText, isMe = true))
+                                        }
+                                    } else {
+                                        webrtcManager?.sendEncrypted(messageText)
+                                    }
+                                    textInput = ""
+                                }
+                            },
+                            modifier = Modifier.size(48.dp),
+                            shape = RoundedCornerShape(24.dp),
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            elevation = FloatingActionButtonDefaults.elevation(0.dp, 0.dp)
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
+                        }
+                    }
                 }
             }
         }
@@ -421,19 +490,34 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun ChatBubble(message: MessageEntity) {
-        val alignment = if (message.isMe) Alignment.CenterEnd else Alignment.CenterStart
-        val color = if (message.isMe) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer
+        if (message.text.isEmpty()) return // Skip rendering empty/broken messages
 
-        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = alignment) {
+        val isMe = message.isMe
+        
+        val bubbleShape = if (isMe) {
+            RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 4.dp)
+        } else {
+            RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 4.dp, bottomEnd = 20.dp)
+        }
+
+        val bgColor = if (isMe) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer
+        val textColor = if (isMe) Color.White else MaterialTheme.colorScheme.onSecondaryContainer
+
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = if (isMe) Alignment.End else Alignment.Start
+        ) {
             Surface(
-                color = color,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.padding(4.dp).widthIn(max = 280.dp)
+                color = bgColor,
+                shape = bubbleShape,
+                tonalElevation = if (isMe) 2.dp else 0.dp,
+                modifier = Modifier.widthIn(max = 300.dp)
             ) {
                 Text(
                     text = message.text,
-                    modifier = Modifier.padding(8.dp),
-                    style = MaterialTheme.typography.bodyLarge
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = textColor
                 )
             }
         }
