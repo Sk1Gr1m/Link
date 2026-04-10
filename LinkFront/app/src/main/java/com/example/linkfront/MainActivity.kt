@@ -1,22 +1,18 @@
 package com.example.linkfront
 
 import android.Manifest
-import android.content.ClipboardManager
-import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Bundle
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -39,8 +35,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import androidx.core.content.ContextCompat
@@ -133,6 +127,7 @@ class MainActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
+    @Suppress("UNUSED_VALUE")
     fun HomeScreen(onNewConnection: () -> Unit, onChatSelected: (String) -> Unit, onProfileClick: () -> Unit) {
         val contactList by peerDao.getAllPeers().collectAsState(initial = emptyList())
         var peerToDelete by remember { mutableStateOf<PeerEntity?>(null) }
@@ -142,18 +137,15 @@ class MainActivity : ComponentActivity() {
             listOf(PeerEntity("SELF", "My Notes", byteArrayOf())) + contactList
         }
 
-        if (peerToDelete != null) {
+        peerToDelete?.let { peer ->
             AlertDialog(
                 onDismissRequest = { peerToDelete = null },
                 title = { Text("Delete Connection?") },
-                text = { Text("Are you sure you want to remove ${peerToDelete?.username}? This will delete your shared history and trust.") },
+                text = { Text("Are you sure you want to remove ${peer.username}? This will delete your shared history and trust.") },
                 confirmButton = {
                     Button(
                         onClick = {
-                            val peer = peerToDelete
-                            if (peer != null) {
-                                scope.launch { peerDao.delete(peer) }
-                            }
+                            scope.launch { peerDao.delete(peer) }
                             peerToDelete = null
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
@@ -207,7 +199,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.pointerInput(Unit) {
                             detectTapGestures(
                                 onTap = { onChatSelected(peer.fingerprint) },
-                                onLongPress = { if (peer.fingerprint != "SELF") peerToDelete = peer }
+                                onLongPress = { if (peer.fingerprint != "SELF") { peerToDelete = peer } }
                             )
                         }
                     )
@@ -219,6 +211,7 @@ class MainActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
+    @Suppress("UNUSED_VALUE")
     fun ProfileScreen(webrtcManager: WebRTCManager?, onBack: () -> Unit) {
         var tempUsername by remember { mutableStateOf(webrtcManager?.myUsername ?: "") }
         var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -354,6 +347,12 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun ChatScreen(webrtcManager: WebRTCManager?, fingerprint: String, onBack: () -> Unit) {
         var textInput by remember { mutableStateOf("") }
+
+        // Example: Intercept back button if there is unsent text
+        BackHandler(enabled = textInput.isNotEmpty()) {
+            textInput = "" // Clear text on first back press if not empty
+        }
+
         val messages by messageDao.getMessagesForPeer(fingerprint).collectAsState(initial = emptyList())
         val sortedMessages = remember(messages) { messages.sortedByDescending { it.id } }
         val listState = rememberLazyListState()
@@ -364,7 +363,7 @@ class MainActivity : ComponentActivity() {
             if (fingerprint == "SELF") return@LaunchedEffect
             
             while (webrtcManager?.connectionStatus == "Disconnected") {
-                webrtcManager?.connectToPeerViaDHT(fingerprint)
+                webrtcManager.connectToPeerViaDHT(fingerprint)
                 kotlinx.coroutines.delay(30000) 
             }
         }
@@ -554,5 +553,27 @@ class MainActivity : ComponentActivity() {
         val fingerprint: String,
         val identityKey: ByteArray,
         val onResponse: (Boolean) -> Unit
-    )
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+
+            other as PairingRequest
+
+            if (username != other.username) return false
+            if (fingerprint != other.fingerprint) return false
+            if (!identityKey.contentEquals(other.identityKey)) return false
+            if (onResponse != other.onResponse) return false
+
+            return true
+        }
+
+        override fun hashCode(): Int {
+            var result = username.hashCode()
+            result = 31 * result + fingerprint.hashCode()
+            result = 31 * result + identityKey.contentHashCode()
+            result = 31 * result + onResponse.hashCode()
+            return result
+        }
+    }
 }
