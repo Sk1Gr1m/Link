@@ -35,39 +35,49 @@ class LinkProtocol(
         this.peerFingerprint = peerFingerprint
     }
 
-    fun sendText(message: String) {
-        val currentFingerprint = peerFingerprint ?: return
+    fun sendText(targetFingerprint: String, message: String) {
+        Log.i(tag, "Sending text message to $targetFingerprint: ${message.take(20)}...")
         scope.launch(Dispatchers.IO) {
+            val isSelf = targetFingerprint == "SELF"
             val msgId = messageDao.insert(MessageEntity(
-                peerFingerprint = currentFingerprint,
+                peerFingerprint = targetFingerprint,
                 text = message,
                 isMe = true,
                 messageType = "TEXT",
-                transferStatus = "PENDING"
+                transferStatus = if (isSelf) "COMPLETED" else "PENDING"
             )).toInt()
 
+            if (isSelf) return@launch
+
             try {
-                val packet = JSONObject().apply {
-                    put("type", "chat")
-                    put("id", msgId)
-                    put("text", message)
+                if (targetFingerprint == peerFingerprint) {
+                    val packet = JSONObject().apply {
+                        put("type", "chat")
+                        put("id", msgId)
+                        put("text", message)
+                    }
+                    if (encryptAndSend(packet)) {
+                        Log.d(tag, "Text message $msgId sent successfully")
+                        messageDao.updateTransferProgress(msgId, 100, "COMPLETED", "")
+                        return@launch
+                    }
                 }
-                if (encryptAndSend(packet)) {
-                    messageDao.updateTransferProgress(msgId, 100, "COMPLETED", "")
-                } else {
-                    messageDao.updateTransferProgress(msgId, 0, "FAILED", "")
-                }
+                
+                Log.e(tag, "Failed to send text message $msgId (not connected to $targetFingerprint)")
+                messageDao.updateTransferProgress(msgId, 0, "FAILED", "")
             } catch (e: Exception) {
+                Log.e(tag, "Error sending text message $msgId: ${e.message}")
                 messageDao.updateTransferProgress(msgId, 0, "FAILED", "")
             }
         }
     }
 
-    fun sendImage(imageBytes: ByteArray) {
-        val currentFingerprint = peerFingerprint ?: return
+    fun sendImage(targetFingerprint: String, imageBytes: ByteArray) {
+        Log.i(tag, "Starting image transfer to $targetFingerprint, size: ${imageBytes.size} bytes")
         scope.launch(Dispatchers.IO) {
             try {
-                val fileName = "img_${System.currentTimeMillis()}.jpg"
+                val isSelf = targetFingerprint == "SELF"
+                val fileName = if (isSelf) "note_${System.currentTimeMillis()}.jpg" else "img_${System.currentTimeMillis()}.jpg"
                 val file = File(context.filesDir, fileName).apply { writeBytes(imageBytes) }
                 
                 val chunkSize = 32 * 1024
@@ -75,14 +85,21 @@ class LinkProtocol(
                 val transferId = System.currentTimeMillis().toString()
 
                 val messageId = messageDao.insert(MessageEntity(
-                    peerFingerprint = currentFingerprint,
+                    peerFingerprint = targetFingerprint,
                     text = "[Image]",
                     isMe = true,
                     messageType = "IMAGE",
                     filePath = file.absolutePath,
-                    transferStatus = "PENDING",
-                    progress = 0
+                    transferStatus = if (isSelf) "COMPLETED" else "PENDING",
+                    progress = if (isSelf) 100 else 0
                 )).toInt()
+
+                if (isSelf) return@launch
+
+                if (targetFingerprint != peerFingerprint) {
+                    messageDao.updateTransferProgress(messageId, 0, "FAILED", file.absolutePath)
+                    return@launch
+                }
 
                 for (i in 0 until totalChunks) {
                     val start = i * chunkSize
@@ -99,11 +116,15 @@ class LinkProtocol(
 
                     if (encryptAndSend(packet)) {
                         val progress = ((i + 1) * 100) / totalChunks
+                        Log.d(tag, "Sent image chunk ${i+1}/$totalChunks for transfer $transferId")
                         if (progress == 100) {
+                            Log.i(tag, "Image transfer $transferId completed")
                             messageDao.updateStatus(messageId, "COMPLETED")
                         } else {
                             messageDao.updateTransferProgress(messageId, progress, "PENDING", file.absolutePath)
                         }
+                    } else {
+                        Log.e(tag, "Failed to send image chunk $i for transfer $transferId")
                     }
                     if (i % 5 == 0) delay(10)
                 }
@@ -114,15 +135,25 @@ class LinkProtocol(
     }
 
     private fun encryptAndSend(json: JSONObject): Boolean {
-        val s = session ?: return false
-        val dc = dataChannel ?: return false
-        if (dc.state() != DataChannel.State.OPEN) return false
+        val s = session ?: run {
+            Log.w(tag, "Cannot send packet: No session established")
+            return false
+        }
+        val dc = dataChannel ?: run {
+            Log.w(tag, "Cannot send packet: No data channel")
+            return false
+        }
+        if (dc.state() != DataChannel.State.OPEN) {
+            Log.w(tag, "Cannot send packet: Data channel state is ${dc.state()}")
+            return false
+        }
         
         return try {
             val encrypted = s.callAttr("encrypt", json.toString()).toJava(ByteArray::class.java)
             dc.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
             true
         } catch (e: Exception) {
+            Log.e(tag, "Encryption or transmission error: ${e.message}")
             false
         }
     }
@@ -167,6 +198,7 @@ class LinkProtocol(
     private fun handleChat(json: JSONObject) {
         val text = json.getString("text")
         val currentFingerprint = peerFingerprint ?: return
+        Log.i(tag, "Received chat from $currentFingerprint: ${text.take(20)}...")
         
         scope.launch(Dispatchers.IO) {
             val newId = messageDao.insert(MessageEntity(
@@ -176,6 +208,7 @@ class LinkProtocol(
                 messageType = "TEXT",
                 transferStatus = "COMPLETED"
             ))
+            Log.d(tag, "Inserted received message $newId, sending ACK")
             sendAck(newId.toInt())
             onMessageReceived?.invoke(text)
         }
@@ -183,6 +216,7 @@ class LinkProtocol(
 
     private fun handleAck(json: JSONObject) {
         val msgId = json.getInt("id")
+        Log.d(tag, "Received ACK for message $msgId")
         scope.launch(Dispatchers.IO) {
             messageDao.updateStatus(msgId, "DELIVERED")
         }

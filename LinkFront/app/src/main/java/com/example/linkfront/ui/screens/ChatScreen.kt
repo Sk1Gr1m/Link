@@ -73,20 +73,7 @@ fun ChatScreen(
                 try {
                     context.contentResolver.openInputStream(it)?.use { inputStream ->
                         val bytes = inputStream.readBytes()
-                        if (fingerprint == "SELF") {
-                            val fileName = "img_${System.currentTimeMillis()}.jpg"
-                            val file = java.io.File(context.filesDir, fileName)
-                            file.writeBytes(bytes)
-                            messageDao.insert(MessageEntity(
-                                peerFingerprint = "SELF",
-                                text = "[Image]",
-                                isMe = true,
-                                messageType = "IMAGE",
-                                filePath = file.absolutePath
-                            ))
-                        } else {
-                            webrtcManager?.sendImage(bytes)
-                        }
+                        webrtcManager?.sendImage(fingerprint, bytes)
                     }
                 } catch (_: Exception) {}
             }
@@ -249,13 +236,13 @@ fun ChatScreen(
                                         val bytes = java.io.File(msg.filePath).readBytes()
                                         // Delete the old failed entry
                                         messageDao.deleteMessageById(msg.id)
-                                        webrtcManager?.sendImage(bytes)
+                                        webrtcManager?.sendImage(fingerprint, bytes)
                                     } catch (_: Exception) {}
                                 }
                             } else {
                                 scope.launch {
                                     messageDao.deleteMessageById(msg.id)
-                                    webrtcManager?.sendEncrypted(msg.text)
+                                    webrtcManager?.sendEncrypted(fingerprint, msg.text)
                                 }
                             }
                         }
@@ -296,14 +283,7 @@ fun ChatScreen(
                         onClick = {
                             if (textInput.isNotBlank()) {
                                 val messageText = textInput
-                                if (fingerprint == "SELF") {
-                                    scope.launch {
-                                        val id = messageDao.insert(MessageEntity(peerFingerprint = "SELF", text = messageText, isMe = true))
-                                        println("Inserted message with ID: $id")
-                                    }
-                                } else {
-                                    webrtcManager?.sendEncrypted(messageText)
-                                }
+                                webrtcManager?.sendEncrypted(fingerprint, messageText)
                                 textInput = ""
                             }
                         },

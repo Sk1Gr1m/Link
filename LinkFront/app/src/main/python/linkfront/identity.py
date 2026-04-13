@@ -32,6 +32,10 @@ class Identity:
     def get_seed_bytes(self):
         return bytes(self.signing_key)
 
+    def get_private_key_bytes(self):
+        """Alias for get_seed_bytes to match Kotlin usage."""
+        return self.get_seed_bytes()
+
     def get_public_key_bytes(self):
         return bytes(self.verify_key)
 

@@ -160,7 +160,11 @@ class MainActivity : ComponentActivity() {
 
     private fun initWebRTC() {
         val intent = Intent(this, LinkService::class.java)
-        startService(intent)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     data class PairingRequest(

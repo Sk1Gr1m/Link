@@ -12,6 +12,7 @@ import com.chaquo.python.Python
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.webrtc.*
 import java.nio.ByteBuffer
@@ -52,7 +53,7 @@ class WebRTCManager(
     private var session: PyObject? = null
     private var ephemeralPrivateKey: ByteArray? = null
     private var ephemeralPublicKey: ByteArray? = null
-    private val trustedPeers = mutableMapOf<String, PeerIdentity>()
+    private val trustedPeers = mutableMapOf<String, PeerIdentity>() // Key: Fingerprint
 
     data class PeerIdentity(val publicKey: ByteArray, val createdAt: Long)
 
@@ -75,27 +76,48 @@ class WebRTCManager(
         
         scope.launch {
             peerDao.getAllPeers().collect { peers ->
-                peers.forEach { trustedPeers[it.username] = PeerIdentity(it.identityKey, 0L) }
+                trustedPeers.clear()
+                peers.forEach { 
+                    trustedPeers[it.fingerprint] = PeerIdentity(it.identityKey, 0L) 
+                }
             }
         }
     }
 
     fun updateUsername(newName: String) = identityManager.updateUsername(newName)
 
+    fun publishMyAddress() = signalingClient.publishAddress()
+
     fun renewConnection() {
-        prepareForNewConnection()
-        peerUsername = "Waiting for peer..."
-        peerFingerprint = null
-        connectionStatus = "Disconnected"
-        signalingClient.publishAddress()
-        onStateChanged?.invoke("Connection Reset")
+        // Run on main thread to avoid deadlocks during WebRTC callbacks
+        Handler(Looper.getMainLooper()).post {
+            peerFingerprint = null
+            prepareForNewConnection()
+            peerUsername = "Waiting for peer..."
+            connectionStatus = "Disconnected"
+            signalingClient.publishAddress()
+            onStateChanged?.invoke("Connection Reset")
+        }
     }
 
     private fun prepareForNewConnection() {
+        dataChannel?.unregisterObserver()
         dataChannel?.dispose()
+        dataChannel = null
+        
         peerConnection?.close()
+        peerConnection?.dispose()
+        peerConnection = null
+        
         peerConnection = createPeerConnection(createRtcConfig())
         session = null
+    }
+
+    fun destroy() {
+        signalingClient.stop()
+        dataChannel?.dispose()
+        peerConnection?.dispose()
+        peerConnectionFactory.dispose()
     }
 
     private fun finishGathering() {
@@ -109,12 +131,17 @@ class WebRTCManager(
     private fun createRtcConfig(): PeerConnection.RTCConfiguration {
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443?transport=tcp")
+                .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer(),
+            PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
                 .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer()
         )
         return PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            // Prioritize TURN if P2P is failing
         }
     }
 
@@ -125,6 +152,7 @@ class WebRTCManager(
                 if (state == PeerConnection.IceGatheringState.COMPLETE) finishGathering()
             }
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+                Log.d(tag, "ICE Connection State Changed: $state")
                 connectionStatus = when(state) {
                     PeerConnection.IceConnectionState.CONNECTED,
                     PeerConnection.IceConnectionState.COMPLETED -> "Verifying..."
@@ -170,7 +198,7 @@ class WebRTCManager(
         dataChannel?.let { setupDataChannel(it) }
 
         onIceGatheringComplete = onSdpReady
-        gatheringHandler.postDelayed(gatheringTimeoutRunnable, 3000)
+        gatheringHandler.postDelayed(gatheringTimeoutRunnable, 5000)
 
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription?) {
@@ -185,7 +213,7 @@ class WebRTCManager(
             override fun onSetSuccess() {
                 if (type == SessionDescription.Type.OFFER) {
                     onIceGatheringComplete = onAnswerReady
-                    gatheringHandler.postDelayed(gatheringTimeoutRunnable, 3000)
+                    gatheringHandler.postDelayed(gatheringTimeoutRunnable, 5000)
                     peerConnection?.createAnswer(object : SimpleSdpObserver() {
                         override fun onCreateSuccess(desc: SessionDescription?) {
                             peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, desc)
@@ -196,7 +224,7 @@ class WebRTCManager(
         }, desc)
     }
 
-    fun processScannedQr(qrData: String, onStatus: ((String) -> Unit)?) {
+    fun processScannedQr(qrData: String, onAnswerReady: ((String) -> Unit)?) {
         try {
             val json = JSONObject(qrData)
             val type = json.getString("type")
@@ -205,15 +233,29 @@ class WebRTCManager(
             val pubKey = hexToBytes(pubKeyHex)
             peerFingerprint = identityManager.getFingerprint(pubKey)
             
+            val sdp = json.getString("sdp")
             if (type == "offer") {
-                val sdp = json.getString("sdp")
                 handleRemoteSdp(sdp, SessionDescription.Type.OFFER) { answerSdp ->
+                    // 1. Try background signaling via DHT
                     signalingClient.sendAnswer(peerFingerprint!!, answerSdp, pubKey)
-                    onStatus?.invoke("Answer Sent")
+                    
+                    // 2. Prepare Answer JSON for manual QR fallback
+                    val answerJson = JSONObject().apply {
+                        put("type", "answer")
+                        put("username", myUsername)
+                        put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
+                        put("sdp", answerSdp)
+                    }
+                    onAnswerReady?.invoke(answerJson.toString())
                 }
+            } else if (type == "answer") {
+                // Peer A scans Peer B's answer - just set the remote description
+                handleRemoteSdp(sdp, SessionDescription.Type.ANSWER, null)
+                // We do NOT call onAnswerReady here, so no "recursion" QR is shown
+                Log.d(tag, "Handshake completed via QR scan")
             }
         } catch (e: Exception) {
-            onStatus?.invoke("Error: ${e.message}")
+            Log.e(tag, "QR Process Error: ${e.message}")
         }
     }
 
@@ -235,9 +277,9 @@ class WebRTCManager(
     private fun sendHandshake() {
         scope.launch {
             val crypto = Python.getInstance().getModule("linkfront.crypto")
-            val pair = crypto.callAttr("generate_ephemeral_keypair")
-            ephemeralPrivateKey = pair.callAttr("get_private_key_bytes").toJava(ByteArray::class.java)
-            ephemeralPublicKey = pair.callAttr("get_public_key_bytes").toJava(ByteArray::class.java)
+            val pair = crypto.callAttr("generate_ephemeral_keypair").toJava(Array<ByteArray>::class.java)
+            ephemeralPrivateKey = pair[0]
+            ephemeralPublicKey = pair[1]
 
             val handshake = JSONObject().apply {
                 put("type", "handshake")
@@ -251,8 +293,8 @@ class WebRTCManager(
     }
 
     // Protocol glue
-    fun sendEncrypted(message: String) = protocol.sendText(message)
-    fun sendImage(bytes: ByteArray) = protocol.sendImage(bytes)
+    fun sendEncrypted(targetFingerprint: String, message: String) = protocol.sendText(targetFingerprint, message)
+    fun sendImage(targetFingerprint: String, bytes: ByteArray) = protocol.sendImage(targetFingerprint, bytes)
     fun getDhtStatus() = signalingClient.getDhtStatus()
 
     fun connectToPeerViaDHT(fingerprint: String) {
@@ -274,26 +316,50 @@ class WebRTCManager(
     private fun handleHandshake(json: JSONObject) {
         val peerIdKey = hexToBytes(json.getString("id_key"))
         val peerEphemeralKey = hexToBytes(json.getString("ephemeral_key"))
-        val peerUsernameReceived = json.getString("username")
-
         val fingerprint = identityManager.getFingerprint(peerIdKey)
         
-        val peerId = trustedPeers[peerUsernameReceived]
+        // RESOLVE IDENTITY: Trust local data over handshake data
+        var peerUsernameReceived = "Unknown Peer"
+        runBlocking {
+            val existingPeer = peerDao.getPeerByFingerprint(fingerprint)
+            val incomingNameFromHandshake = json.optString("username", "")
+            val fingerprintRegex = Regex("^([0-9A-F]{4}:){3}[0-9A-F]{4}.*")
+            
+            peerUsernameReceived = when {
+                // 1. If this matches the QR we just scanned, use the name from the QR
+                fingerprint == peerFingerprint -> peerUsername
+                
+                // 2. If they are in the database, use our saved name
+                existingPeer != null -> existingPeer.username
+                
+                // 3. If they sent a fingerprint as a name, sanitize it
+                fingerprintRegex.matches(incomingNameFromHandshake) -> "Peer ${fingerprint.take(8)}"
+                
+                // 4. New peer, use their provided name or fallback
+                else -> incomingNameFromHandshake.ifEmpty { "Unknown Peer" }
+            }
+        }
+        
+        val peerId = trustedPeers[fingerprint]
         if (peerId != null) {
-            completeHandshake(peerIdKey, peerEphemeralKey, peerId.publicKey)
+            if (!peerId.publicKey.contentEquals(peerIdKey)) {
+                Log.e(tag, "Identity mismatch for fingerprint: $fingerprint")
+                return
+            }
+            completeHandshake(peerUsernameReceived, peerIdKey, peerEphemeralKey)
         } else {
             onConnectionRequest(peerUsernameReceived, fingerprint, peerIdKey) { accepted ->
                 if (accepted) {
                     scope.launch {
-                        peerDao.insert(PeerEntity(peerUsernameReceived, fingerprint, peerIdKey))
-                        completeHandshake(peerIdKey, peerEphemeralKey, peerIdKey)
+                        peerDao.insert(PeerEntity(fingerprint, peerUsernameReceived, peerIdKey))
+                        completeHandshake(peerUsernameReceived, peerIdKey, peerEphemeralKey)
                     }
                 }
             }
         }
     }
 
-    private fun completeHandshake(peerIdKey: ByteArray, peerEphemeralKey: ByteArray, trustedIdKey: ByteArray) {
+    private fun completeHandshake(username: String, peerIdKey: ByteArray, peerEphemeralKey: ByteArray) {
         val crypto = Python.getInstance().getModule("linkfront.crypto")
         session = crypto.callAttr("establish_session", 
             identityManager.identity?.callAttr("get_private_key_bytes"),
@@ -302,7 +368,7 @@ class WebRTCManager(
             peerEphemeralKey
         )
         peerFingerprint = identityManager.getFingerprint(peerIdKey)
-        peerUsername = "Connected"
+        peerUsername = username
         connectionStatus = "Connected"
         protocol.setSession(session, dataChannel, peerFingerprint)
         onStateChanged?.invoke("Connected")
@@ -311,21 +377,28 @@ class WebRTCManager(
     private fun thinSdp(sdp: String): String {
         val lines = sdp.lines()
         val filtered = mutableListOf<String>()
-        var skipCurrentSection = false
         
+        // Essential attributes for WebRTC handshake and basic media
+        val essentialPrefixes = listOf(
+            "v=", "o=", "s=", "t=", "c=", "a=group:", "a=msid-semantic:",
+            "m=", "a=mid:", "a=setup:", "a=fingerprint:", "a=ice-ufrag:", "a=ice-pwd:",
+            "a=candidate:", "a=sctpmap:", "a=sctp-port:", "a=max-message-size:",
+            "a=rtpmap:", "a=fmtp:", "a=rtcp-mux", "a=rtcp:"
+        )
+
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
-            if (trimmed.startsWith("m=")) skipCurrentSection = trimmed.startsWith("m=audio") || trimmed.startsWith("m=video")
-            if (!skipCurrentSection) {
-                if (trimmed.startsWith("a=candidate:")) {
-                    if (trimmed.contains("127.0.0.1") || trimmed.contains("::1") || trimmed.contains("localhost")) continue
-                    filtered.add(trimmed.split(" ").filter { it !in listOf("generation", "network-id", "network-cost") }.joinToString(" "))
-                    continue
-                }
-                val blacklist = listOf("a=extmap:", "a=rtcp-fb:", "a=msid:", "a=ssrc:", "a=mid:audio", "a=mid:video", "a=max-ptime:", "a=ptime:")
-                if (blacklist.any { trimmed.startsWith(it) }) continue
+            
+            // Keep essential lines and anything not blacklisted
+            if (essentialPrefixes.any { trimmed.startsWith(it) }) {
                 filtered.add(trimmed)
+            } else {
+                // Skip large metadata that isn't strictly required for basic connectivity
+                val blacklist = listOf("a=extmap:", "a=msid:", "a=ssrc:", "a=max-ptime:", "a=ptime:", "a=rtcp-fb:")
+                if (!blacklist.any { trimmed.startsWith(it) }) {
+                    filtered.add(trimmed)
+                }
             }
         }
         return filtered.joinToString("\r\n") + "\r\n"

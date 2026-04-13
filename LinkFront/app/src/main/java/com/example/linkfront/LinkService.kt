@@ -62,6 +62,19 @@ class LinkService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        
+        // Use a notification immediately on start for Android 12 compliance
+        val notification = notificationHelper.getServiceNotification()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to start foreground service: ${e.message}")
+        }
+
         return START_STICKY
     }
 
@@ -108,6 +121,7 @@ class LinkService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        webrtcManager?.destroy()
         job.cancel()
         Log.d(tag, "Service Destroyed")
     }

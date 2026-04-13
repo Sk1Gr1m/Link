@@ -57,10 +57,11 @@ fun ProfileScreen(
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             webrtcManager?.processScannedQr(result.contents) { answerQr ->
+                // If the scanned QR was an Offer, this callback provides the Answer QR
                 val encoder = BarcodeEncoder()
                 try {
                     qrBitmap = encoder.encodeBitmap(answerQr, BarcodeFormat.QR_CODE, 512, 512)
-                    qrLabel = "Answer QR (Let peer scan this)"
+                    qrLabel = "Answer QR (Let Peer A scan this)"
                 } catch (e: Exception) {
                     android.util.Log.e("ProfileScreen", "Failed to encode Answer QR: ${e.message}")
                 }
