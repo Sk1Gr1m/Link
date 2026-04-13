@@ -25,6 +25,12 @@ interface MessageDao {
     @Query("UPDATE messages SET progress = :progress, transferStatus = :status, filePath = :filePath WHERE id = :id")
     suspend fun updateTransferProgress(id: Int, progress: Int, status: String, filePath: String)
 
+    @Query("UPDATE messages SET transferStatus = :status WHERE id = :id")
+    suspend fun updateStatus(id: Int, status: String)
+
+    @Query("UPDATE messages SET transferStatus = 'FAILED' WHERE transferStatus = 'PENDING' AND peerFingerprint = :fingerprint")
+    suspend fun markPendingAsFailed(fingerprint: String)
+
     @Query("SELECT MAX(id) FROM messages")
     suspend fun getLastInsertedId(): Int
 }

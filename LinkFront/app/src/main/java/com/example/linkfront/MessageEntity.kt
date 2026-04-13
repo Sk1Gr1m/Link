@@ -12,6 +12,6 @@ data class MessageEntity(
     val timestamp: Long = System.currentTimeMillis(),
     val messageType: String = "TEXT", // "TEXT" or "IMAGE"
     val filePath: String? = null,     // Path to local image file
-    val transferStatus: String = "COMPLETED", // "PENDING", "COMPLETED", "FAILED"
+    val transferStatus: String = "COMPLETED", // "PENDING", "COMPLETED", "DELIVERED", "FAILED"
     val progress: Int = 100
 )

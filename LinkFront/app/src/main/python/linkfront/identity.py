@@ -10,7 +10,12 @@ class Identity:
             if isinstance(seed, (bytes, bytearray)):
                 self.signing_key = SigningKey(seed[:32])
             elif isinstance(seed, str):
-                self.signing_key = SigningKey(seed.encode()[:32])
+                try:
+                    # Try to decode as hex if it's a hex string
+                    self.signing_key = SigningKey(bytes.fromhex(seed))
+                except ValueError:
+                    # Fallback to raw encoding if not hex
+                    self.signing_key = SigningKey(seed.encode()[:32])
             else:
                 # Handle list from Java
                 seed_bytes = bytes(x & 0xff for x in seed)
@@ -21,11 +26,20 @@ class Identity:
         self.verify_key = self.signing_key.verify_key
         self.created_at = int(created_at) if created_at is not None else int(time.time())
 
+    def get_private_key_hex(self):
+        return bytes(self.signing_key).hex()
+
     def get_seed_bytes(self):
         return bytes(self.signing_key)
 
     def get_public_key_bytes(self):
         return bytes(self.verify_key)
+
+    def get_encryption_public_key_bytes(self):
+        return bytes(self.verify_key.to_curve25519_public_key())
+
+    def get_encryption_private_key_bytes(self):
+        return bytes(self.signing_key.to_curve25519_private_key())
 
     def get_created_at(self):
         return self.created_at
@@ -46,15 +60,11 @@ class Identity:
         return json.dumps(data)
 
     def get_connection_qr(self, username, sdp, sdp_type):
-        """Creates a QR string containing identity AND WebRTC signaling data."""
-        data = {
-            "u": username,
-            "k": base64.b64encode(bytes(self.verify_key)).decode('utf-8'),
-            "t": self.created_at,
-            "s": sdp,
-            "st": sdp_type # "offer" or "answer"
-        }
-        return json.dumps(data)
+        """Creates a compact QR string: username|pubkey_b64|timestamp|sdp|sdp_type"""
+        k_b64 = base64.b64encode(bytes(self.verify_key)).decode('utf-8')
+        s = sdp if sdp else "None"
+        st = sdp_type if sdp_type else "None"
+        return f"{username}|{k_b64}|{self.created_at}|{s}|{st}"
 
 def get_fingerprint(pub_key_bytes):
     import hashlib
@@ -73,12 +83,22 @@ def verify_signature(pub_key_bytes, signature, message_bytes):
         return False
 
 def parse_qr_data(qr_string):
+    if "|" in qr_string:
+        parts = qr_string.split("|")
+        # Return as a tuple: (username, key_bytes, timestamp, sdp, sdp_type)
+        return (
+            parts[0],
+            base64.b64decode(parts[1]),
+            int(parts[2]),
+            parts[3] if parts[3] != "None" else None,
+            parts[4] if parts[4] != "None" else None
+        )
+    # Fallback for old JSON format
     data = json.loads(qr_string)
-    # Return as a tuple: (username, key_bytes, timestamp, sdp, sdp_type)
     return (
         data["u"], 
         base64.b64decode(data["k"]), 
         data.get("t", 0),
-        data.get("s"),    # Optional SDP
-        data.get("st")    # Optional SDP type
+        data.get("s"),
+        data.get("st")
     )

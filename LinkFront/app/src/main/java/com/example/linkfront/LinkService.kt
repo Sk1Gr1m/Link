@@ -1,16 +1,23 @@
 package com.example.linkfront
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import android.content.pm.ServiceInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 class LinkService : Service() {
     private val tag = "LinkService"
@@ -36,7 +43,44 @@ class LinkService : Service() {
         super.onCreate()
         Log.d(tag, "Service Creating")
         notificationHelper = NotificationHelper(this)
+        
+        val notification = notificationHelper.getServiceNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification)
+        }
+
         initManager()
+        registerNetworkCallback()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "STOP_SERVICE") {
+            Log.d(tag, "Stop signal received via notification")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
+
+    private fun registerNetworkCallback() {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+
+        connectivityManager.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.d(tag, "Network available, triggering DHT refresh")
+                webrtcManager?.publishMyAddress()
+            }
+
+            override fun onLost(network: Network) {
+                Log.d(tag, "Network lost")
+            }
+        })
     }
 
     private fun initManager() {

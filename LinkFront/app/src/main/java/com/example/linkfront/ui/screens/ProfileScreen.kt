@@ -16,6 +16,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.example.linkfront.MainActivity
 import com.example.linkfront.WebRTCManager
@@ -34,13 +35,35 @@ fun ProfileScreen(
 ) {
     var tempUsername by remember { mutableStateOf(webrtcManager?.myUsername ?: "") }
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var qrLabel by remember { mutableStateOf<String?>(null) }
+    var dhtStatus by remember { mutableStateOf("Checking DHT...") }
     val scrollState = rememberScrollState()
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            val statusJson = webrtcManager?.getDhtStatus()
+            if (statusJson != null) {
+                try {
+                    val obj = org.json.JSONObject(statusJson)
+                    val isConnected = obj.getBoolean("is_connected")
+                    val neighbors = obj.getInt("neighbor_count")
+                    dhtStatus = if (isConnected) "DHT Connected ($neighbors nodes)" else "DHT Disconnected"
+                } catch (_: Exception) {}
+            }
+            kotlinx.coroutines.delay(5000)
+        }
+    }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             webrtcManager?.processScannedQr(result.contents) { answerQr ->
                 val encoder = BarcodeEncoder()
-                qrBitmap = encoder.encodeBitmap(answerQr, BarcodeFormat.QR_CODE, 512, 512)
+                try {
+                    qrBitmap = encoder.encodeBitmap(answerQr, BarcodeFormat.QR_CODE, 512, 512)
+                    qrLabel = "Answer QR (Let peer scan this)"
+                } catch (e: Exception) {
+                    android.util.Log.e("ProfileScreen", "Failed to encode Answer QR: ${e.message}")
+                }
             }
         }
     }
@@ -118,10 +141,28 @@ fun ProfileScreen(
                 color = MaterialTheme.colorScheme.secondary
             )
 
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = dhtStatus,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (dhtStatus.contains("Connected")) Color(0xFF4CAF50) else MaterialTheme.colorScheme.error
+            )
+
+            Text(
+                text = "Connection: ${webrtcManager?.connectionStatus ?: "Unknown"}",
+                style = MaterialTheme.typography.bodySmall,
+                color = when(webrtcManager?.connectionStatus) {
+                    "Connected" -> Color(0xFF4CAF50)
+                    "Verifying..." -> Color(0xFFFF9800)
+                    else -> MaterialTheme.colorScheme.secondary
+                }
+            )
+
             HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
 
             if (qrBitmap != null) {
-                Text("Connection QR", style = MaterialTheme.typography.titleMedium)
+                Text(qrLabel ?: "Connection QR", style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(8.dp))
                 Image(
                     bitmap = qrBitmap!!.asImageBitmap(),
@@ -145,7 +186,12 @@ fun ProfileScreen(
                 onClick = {
                     webrtcManager?.getConnectionQrData { qrData ->
                         val encoder = BarcodeEncoder()
-                        qrBitmap = encoder.encodeBitmap(qrData, BarcodeFormat.QR_CODE, 512, 512)
+                        try {
+                            qrBitmap = encoder.encodeBitmap(qrData, BarcodeFormat.QR_CODE, 512, 512)
+                            qrLabel = "Offer QR (Peer scans this)"
+                        } catch (e: Exception) {
+                            android.util.Log.e("ProfileScreen", "Failed to encode Offer QR: ${e.message}")
+                        }
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
@@ -160,6 +206,20 @@ fun ProfileScreen(
                 },
                 modifier = Modifier.fillMaxWidth()
             ) { Text("2. Scan Peer's QR") }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            TextButton(
+                onClick = {
+                    webrtcManager?.renewConnection()
+                    qrBitmap = null
+                    qrLabel = null
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Renew Session / Reset Connection")
+            }
         }
     }
 }

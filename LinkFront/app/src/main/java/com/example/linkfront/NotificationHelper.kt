@@ -31,9 +31,11 @@ class NotificationHelper(private val context: Context) {
             val serviceChannel = NotificationChannel(
                 SERVICE_CHANNEL_ID,
                 "Link Background Service",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_MIN
             ).apply {
-                description = "Keeps the secure messaging engine running in the background"
+                description = "Keeps the secure messaging engine running"
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
             }
 
             val chatChannel = NotificationChannel(
@@ -50,11 +52,33 @@ class NotificationHelper(private val context: Context) {
     }
 
     fun getServiceNotification(): Notification {
+        val appIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val appPendingIntent = PendingIntent.getActivity(
+            context, 0, appIntent, PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val quitIntent = Intent(context, LinkService::class.java).apply {
+            action = "STOP_SERVICE"
+        }
+        val quitPendingIntent = PendingIntent.getService(
+            context, 
+            0, 
+            quitIntent, 
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         return NotificationCompat.Builder(context, SERVICE_CHANNEL_ID)
-            .setContentTitle("Link is active")
-            .setContentText("Maintaining secure connections...")
+            .setContentTitle("Link")
+            .setContentText("Link active")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setOngoing(true)
+            .setContentIntent(appPendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Quit", quitPendingIntent)
             .build()
     }
 

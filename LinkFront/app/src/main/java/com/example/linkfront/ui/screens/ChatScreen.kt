@@ -17,8 +17,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -191,6 +194,13 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    if (fingerprint != "SELF") {
+                        IconButton(onClick = {
+                            webrtcManager?.connectToPeerViaDHT(fingerprint)
+                        }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Reconnect")
+                        }
+                    }
                     IconButton(onClick = { showMenu = !showMenu }) {
                         Icon(Icons.Default.Settings, contentDescription = "More")
                     }
@@ -231,7 +241,24 @@ fun ChatScreen(
                     ChatBubble(
                         message = msg,
                         onLongClick = { messageToDelete = msg },
-                        onImageClick = { fullScreenImagePath = it }
+                        onImageClick = { fullScreenImagePath = it },
+                        onRetry = {
+                            if (msg.messageType == "IMAGE" && msg.filePath != null) {
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        val bytes = java.io.File(msg.filePath).readBytes()
+                                        // Delete the old failed entry
+                                        messageDao.deleteMessageById(msg.id)
+                                        webrtcManager?.sendImage(bytes)
+                                    } catch (_: Exception) {}
+                                }
+                            } else {
+                                scope.launch {
+                                    messageDao.deleteMessageById(msg.id)
+                                    webrtcManager?.sendEncrypted(msg.text)
+                                }
+                            }
+                        }
                     )
                 }
             }
@@ -298,7 +325,8 @@ fun ChatScreen(
 fun ChatBubble(
     message: MessageEntity,
     onLongClick: () -> Unit,
-    onImageClick: (String) -> Unit
+    onImageClick: (String) -> Unit,
+    onRetry: () -> Unit
 ) {
     if (message.text.isEmpty() && message.messageType != "IMAGE") return
 
@@ -356,7 +384,7 @@ fun ChatBubble(
                                 contentDescription = "Image message",
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .heightIn(max = 400.dp),
+                                    .heightIn(max = 250.dp),
                                 contentScale = ContentScale.Crop
                             )
                             if (message.transferStatus == "PENDING") {
@@ -383,12 +411,42 @@ fun ChatBubble(
                         color = textColor
                     )
                 }
-                Text(
-                    text = timeString,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = textColor.copy(alpha = 0.7f),
-                    modifier = Alignment.End.let { Modifier.align(it) }
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = timeString,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = textColor.copy(alpha = 0.7f),
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (isMe) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        when (message.transferStatus) {
+                            "PENDING" -> Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "Pending",
+                                modifier = Modifier.size(12.dp),
+                                tint = textColor.copy(alpha = 0.7f)
+                            )
+                            "DELIVERED" -> Icon(
+                                Icons.Default.CheckCircle,
+                                contentDescription = "Delivered",
+                                modifier = Modifier.size(12.dp),
+                                tint = Color(0xFF4CAF50)
+                            )
+                            "FAILED" -> IconButton(
+                                onClick = onRetry,
+                                modifier = Modifier.size(16.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Warning,
+                                    contentDescription = "Retry",
+                                    modifier = Modifier.size(14.dp),
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
