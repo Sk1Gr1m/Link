@@ -253,7 +253,23 @@ class WebRTCManager(
     // Protocol glue
     fun sendEncrypted(message: String) = protocol.sendText(message)
     fun sendImage(bytes: ByteArray) = protocol.sendImage(bytes)
-    fun getDhtStatus() = signalingClient.publishAddress() // Dummy/Cleanup needed
+    fun getDhtStatus() = signalingClient.getDhtStatus()
+
+    fun connectToPeerViaDHT(fingerprint: String) {
+        scope.launch {
+            val address = signalingClient.lookupAddress(fingerprint)
+            if (address != null) {
+                createOffer { sdp ->
+                    scope.launch {
+                        val answerSdp = signalingClient.sendOfferDirectly(address.first, address.second, sdp)
+                        if (answerSdp != null) {
+                            handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private fun handleHandshake(json: JSONObject) {
         val peerIdKey = hexToBytes(json.getString("id_key"))

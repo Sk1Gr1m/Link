@@ -136,7 +136,7 @@ fun ProfileScreen(
             Spacer(modifier = Modifier.height(8.dp))
             
             Text(
-                text = "Fingerprint: ${webrtcManager?.getFingerprint() ?: "Unknown"}",
+                text = "Fingerprint: ${webrtcManager?.myFingerprint ?: "Unknown"}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.secondary
             )

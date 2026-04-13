@@ -95,6 +95,16 @@ class SignalingClient(
         }
     }
 
+    fun getDhtStatus(): String? {
+        val py = Python.getInstance()
+        return try {
+            val dhtNode = py.getModule("linkfront.dht_node")
+            dhtNode.callAttr("get_dht_status").toString()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun publishAddress() {
         scope.launch {
             try {
@@ -105,6 +115,48 @@ class SignalingClient(
                 }
             } catch (e: Exception) {
                 Log.e(tag, "Publish error: ${e.message}")
+            }
+        }
+    }
+
+    suspend fun lookupAddress(fingerprint: String): Pair<String, Int>? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val result = linkModule.callAttr("lookup_address", fingerprint)
+                if (result != null && result.toString() != "None") {
+                    val map = result.asMap()
+                    val ip = map[PyObject.fromJava("ip")]?.toString()
+                    val port = map[PyObject.fromJava("port")]?.toInt()
+                    if (ip != null && port != null) {
+                        return@withContext Pair(ip, port)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Lookup error: ${e.message}")
+            }
+            null
+        }
+    }
+
+    suspend fun sendOfferDirectly(ip: String, port: Int, sdp: String): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val socket = Socket()
+                socket.connect(java.net.InetSocketAddress(ip, port), 3000)
+                val request = JSONObject().apply {
+                    put("type", "offer")
+                    put("sdp", sdp)
+                }
+                socket.getOutputStream().write(request.toString().toByteArray())
+                socket.getOutputStream().flush()
+                
+                val responseText = socket.getInputStream().bufferedReader().readText()
+                val responseJson = JSONObject(responseText)
+                socket.close()
+                responseJson.getString("sdp")
+            } catch (e: Exception) {
+                Log.e(tag, "Direct offer failed: ${e.message}")
+                null
             }
         }
     }
