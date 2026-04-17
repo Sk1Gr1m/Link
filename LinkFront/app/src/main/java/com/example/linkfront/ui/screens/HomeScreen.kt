@@ -31,7 +31,7 @@ fun HomeScreen(
     val scope = rememberCoroutineScope()
 
     val displayContacts = remember(contactList) {
-        listOf(PeerEntity("SELF", "SELF", byteArrayOf())) + contactList
+        listOf(PeerEntity("SELF", "My Notes", byteArrayOf())) + contactList
     }
 
     peerToDelete?.let { peer ->

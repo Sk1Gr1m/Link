@@ -28,9 +28,9 @@ interface MessageDao {
     @Query("UPDATE messages SET transferStatus = :status WHERE id = :id")
     suspend fun updateStatus(id: Int, status: String)
 
-    @Query("UPDATE messages SET transferStatus = 'FAILED' WHERE transferStatus = 'PENDING' AND peerFingerprint = :fingerprint")
-    suspend fun markPendingAsFailed(fingerprint: String)
+    @Query("SELECT * FROM messages WHERE transferStatus = 'FAILED' AND peerFingerprint = :fingerprint")
+    suspend fun getFailedMessagesForPeer(fingerprint: String): List<MessageEntity>
 
-    @Query("SELECT MAX(id) FROM messages")
-    suspend fun getLastInsertedId(): Int
+    @Query("UPDATE messages SET transferStatus = 'PENDING' WHERE id = :id")
+    suspend fun markAsPending(id: Int)
 }

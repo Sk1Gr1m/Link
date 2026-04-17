@@ -53,7 +53,8 @@ class SignalingClient(
 
     private suspend fun handleClient(socket: Socket) {
         try {
-            val input = socket.getInputStream().bufferedReader().readText()
+            val reader = socket.getInputStream().bufferedReader()
+            val input = reader.readLine() ?: return
             val json = JSONObject(input)
             val type = json.getString("type")
             val isEncrypted = json.optBoolean("encrypted", false)
@@ -61,18 +62,32 @@ class SignalingClient(
 
             if (isEncrypted) {
                 val cryptoModule = py.getModule("linkfront.crypto")
-                val myPrivKey = identityManager.getEncryptionPrivateKeyBytes()
-                sdp = cryptoModule.callAttr("decrypt_with_my_key", sdp, myPrivKey).toString()
+                val myPrivKey = identityManager.identity?.callAttr("get_seed_bytes")
+                val encryptedSdp = android.util.Base64.decode(sdp, android.util.Base64.DEFAULT)
+                sdp = cryptoModule.callAttr("decrypt_with_my_key", encryptedSdp, myPrivKey).toString()
             }
 
             when (type.lowercase()) {
                 "offer" -> {
+                    val answerDeferred = CompletableDeferred<String>()
                     onOfferReceived(sdp) { answer ->
+                        answerDeferred.complete(answer)
+                    }
+                    try {
+                        val answer = withTimeout(15000) { answerDeferred.await() }
                         val response = JSONObject()
                         response.put("type", "answer")
                         response.put("sdp", answer)
-                        socket.getOutputStream().write(response.toString().toByteArray())
-                        socket.getOutputStream().flush()
+                        try {
+                            if (socket.isConnected && !socket.isOutputShutdown) {
+                                socket.getOutputStream().write((response.toString() + "\n").toByteArray())
+                                socket.getOutputStream().flush()
+                            }
+                        } catch (e: Exception) {
+                            Log.e(tag, "Failed to send answer to socket: ${e.message}")
+                        }
+                    } catch (e: TimeoutCancellationException) {
+                        Log.e(tag, "Timed out waiting for WebRTC answer")
                     }
                 }
                 "answer" -> {
@@ -88,9 +103,18 @@ class SignalingClient(
 
     private fun startHeartbeat() {
         scope.launch {
+            var iterations = 0
             while (isActive) {
                 publishAddress()
-                delay(5 * 60 * 1000) // 5 minutes
+                
+                // First 60 seconds: publish every 5 seconds for fast discovery
+                // After that: every 5 minutes
+                if (iterations < 12) {
+                    delay(5000)
+                } else {
+                    delay(5 * 60 * 1000)
+                }
+                iterations++
             }
         }
     }
@@ -108,10 +132,21 @@ class SignalingClient(
     fun publishAddress() {
         scope.launch {
             try {
-                val publicIp = linkModule.callAttr("get_public_ip")?.toString()
-                val fingerprint = identityManager.fingerprint
-                if (publicIp != null && localPort != 0) {
-                    linkModule.callAttr("publish_address", fingerprint, publicIp, localPort)
+                val statusJson = linkModule.callAttr("get_dht_status").toString()
+                val status = JSONObject(statusJson)
+                val publicIp = status.optString("public_ip", "None")
+                val localIp = status.optString("local_ip", "0.0.0.0")
+                val dhtPort = status.optInt("listen_port", 0)
+                
+                // CRITICAL: Only publish if we have a real IP address and the DHT is listening
+                if (localIp != "0.0.0.0" && localIp != "127.0.0.1" && localIp != "Checking..." && dhtPort != 0) {
+                    val fingerprint = identityManager.fingerprint
+                    if (localPort != 0) {
+                        Log.i(tag, "Publishing address: $localIp:$localPort (DHT: $dhtPort)")
+                        linkModule.callAttr("publish_address", fingerprint, publicIp, localIp, localPort, dhtPort)
+                    }
+                } else {
+                    Log.d(tag, "Delaying publish: IP not ready ($localIp) or DHT not listening ($dhtPort)")
                 }
             } catch (e: Exception) {
                 Log.e(tag, "Publish error: ${e.message}")
@@ -119,45 +154,71 @@ class SignalingClient(
         }
     }
 
-    suspend fun lookupAddress(fingerprint: String): Pair<String, Int>? {
+    suspend fun lookupAddress(fingerprint: String): List<Pair<String, Int>> {
         return withContext(Dispatchers.IO) {
+            val addresses = mutableListOf<Pair<String, Int>>()
             try {
                 val result = linkModule.callAttr("lookup_address", fingerprint)
                 if (result != null && result.toString() != "None") {
                     val map = result.asMap()
-                    val ip = map[PyObject.fromJava("ip")]?.toString()
-                    val port = map[PyObject.fromJava("port")]?.toInt()
-                    if (ip != null && port != null) {
-                        return@withContext Pair(ip, port)
+                    val signalingPort = map[PyObject.fromJava("port")]?.toInt() ?: 0
+                    val dhtPort = map[PyObject.fromJava("dht_port")]?.toInt() ?: 0
+                    
+                    val publicIp = map[PyObject.fromJava("public_ip")]?.toString()
+                    val localIp = map[PyObject.fromJava("local_ip")]?.toString()
+
+                    if (signalingPort != 0) {
+                        if (publicIp != null && publicIp != "None") addresses.add(publicIp to signalingPort)
+                        if (localIp != null && localIp != "None") addresses.add(localIp to signalingPort)
+                    }
+                    
+                    // Also use the discovered DHT port to bootstrap our DHT
+                    if (dhtPort != 0) {
+                        if (publicIp != null && publicIp != "None") {
+                            linkModule.callAttr("add_dht_bootstrap", publicIp, dhtPort)
+                        }
+                        if (localIp != null && localIp != "None") {
+                            linkModule.callAttr("add_dht_bootstrap", localIp, dhtPort)
+                        }
                     }
                 }
             } catch (e: Exception) {
                 Log.e(tag, "Lookup error: ${e.message}")
             }
-            null
+            addresses
         }
     }
 
     suspend fun sendOfferDirectly(ip: String, port: Int, sdp: String): String? {
         return withContext(Dispatchers.IO) {
-            try {
-                val socket = Socket()
-                socket.connect(java.net.InetSocketAddress(ip, port), 3000)
-                val request = JSONObject().apply {
-                    put("type", "offer")
-                    put("sdp", sdp)
+            var lastError: String? = null
+            for (attempt in 1..3) {
+                try {
+                    val socket = Socket()
+                    socket.connect(java.net.InetSocketAddress(ip, port), 3000)
+                    val request = JSONObject().apply {
+                        put("type", "offer")
+                        put("sdp", sdp)
+                    }
+                    socket.getOutputStream().write((request.toString() + "\n").toByteArray())
+                    socket.getOutputStream().flush()
+                    
+                    val responseText = socket.getInputStream().bufferedReader().readLine()
+                    if (responseText == null) {
+                        socket.close()
+                        continue
+                    }
+                    val responseJson = JSONObject(responseText)
+                    socket.close()
+                    return@withContext responseJson.getString("sdp")
+                } catch (e: Exception) {
+                    lastError = e.message
+                    Log.e(tag, "Direct offer attempt $attempt failed: ${e.message}")
+                    if (attempt < 3) delay(1000L * attempt) // Exponential-ish backoff
                 }
-                socket.getOutputStream().write(request.toString().toByteArray())
-                socket.getOutputStream().flush()
-                
-                val responseText = socket.getInputStream().bufferedReader().readText()
-                val responseJson = JSONObject(responseText)
-                socket.close()
-                responseJson.getString("sdp")
-            } catch (e: Exception) {
-                Log.e(tag, "Direct offer failed: ${e.message}")
-                null
             }
+            Log.e(tag, "Direct offer failed after 3 attempts: $lastError")
+            null
         }
     }
 
@@ -168,37 +229,38 @@ class SignalingClient(
             val cryptoModule = py.getModule("linkfront.crypto")
             
             if (peerPublicKey != null) {
-                val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey)
-                linkModule.callAttr("put_value", postBoxKey, encrypted)
+                val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey).toJava(ByteArray::class.java)
+                val encryptedB64 = android.util.Base64.encodeToString(encrypted, android.util.Base64.NO_WRAP)
+                linkModule.callAttr("put_value", postBoxKey, encryptedB64)
             } else {
                 linkModule.callAttr("put_value", postBoxKey, answerSdp)
             }
 
-            // 2. Direct Socket
-            val peerAddr = linkModule.callAttr("lookup_address", fingerprint)
-            if (peerAddr != null) {
-                val ip = peerAddr.asMap()[PyObject.fromJava("ip")]?.toString()
-                val port = peerAddr.asMap()[PyObject.fromJava("port")]?.toInt()
-                if (ip != null && port != null) {
-                    try {
-                        val socket = Socket()
-                        socket.connect(java.net.InetSocketAddress(ip, port), 2000)
-                        val request = JSONObject()
-                        request.put("type", "answer")
-                        
-                        if (peerPublicKey != null) {
-                            val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey)
-                            request.put("sdp", encrypted.toString())
-                            request.put("encrypted", true)
-                        } else {
-                            request.put("sdp", answerSdp)
-                            request.put("encrypted", false)
-                        }
-                        socket.getOutputStream().write(request.toString().toByteArray())
-                        socket.close()
-                    } catch (e: Exception) {
-                        Log.d(tag, "Direct answer failed: ${e.message}")
+            // 2. Direct Socket to all known addresses
+            val addresses = lookupAddress(fingerprint)
+            for ((ip, port) in addresses) {
+                try {
+                    val socket = Socket()
+                    socket.connect(java.net.InetSocketAddress(ip, port), 2000)
+                    val request = JSONObject()
+                    request.put("type", "answer")
+                    
+                    if (peerPublicKey != null) {
+                        val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey).toJava(ByteArray::class.java)
+                        val encryptedB64 = android.util.Base64.encodeToString(encrypted, android.util.Base64.NO_WRAP)
+                        request.put("sdp", encryptedB64)
+                        request.put("encrypted", true)
+                    } else {
+                        request.put("sdp", answerSdp)
+                        request.put("encrypted", false)
                     }
+                    socket.getOutputStream().write((request.toString() + "\n").toByteArray())
+                    socket.getOutputStream().flush()
+                    socket.close()
+                    Log.d(tag, "Direct answer sent to $ip:$port")
+                    break // Successfully sent to one address
+                } catch (e: Exception) {
+                    Log.d(tag, "Direct answer failed for $ip:$port: ${e.message}")
                 }
             }
         }
@@ -212,8 +274,9 @@ class SignalingClient(
                 if (encrypted != null && encrypted.toString() != "None") {
                     try {
                         val cryptoModule = py.getModule("linkfront.crypto")
-                        val myPrivKey = identityManager.getEncryptionPrivateKeyBytes()
-                        val decrypted = cryptoModule.callAttr("decrypt_with_my_key", encrypted, myPrivKey).toString()
+                        val myPrivKey = identityManager.identity?.callAttr("get_seed_bytes")
+                        val encryptedBytes = android.util.Base64.decode(encrypted.toString(), android.util.Base64.DEFAULT)
+                        val decrypted = cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
                         callback(decrypted)
                         linkModule.callAttr("put_value", postBoxKey, "None")
                         break

@@ -18,6 +18,9 @@ interface PeerDao {
     suspend fun delete(peer: PeerEntity)
 
     @Query("SELECT * FROM peers WHERE fingerprint = :fingerprint")
+    fun getPeerFlowByFingerprint(fingerprint: String): kotlinx.coroutines.flow.Flow<PeerEntity?>
+
+    @Query("SELECT * FROM peers WHERE fingerprint = :fingerprint")
     suspend fun getPeerByFingerprint(fingerprint: String): PeerEntity?
 
     @Query("DELETE FROM peers")

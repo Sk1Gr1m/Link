@@ -8,10 +8,12 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import com.chaquo.python.Python
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,6 +27,7 @@ class LinkService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + job)
     
     private lateinit var notificationHelper: NotificationHelper
+    private var multicastLock: WifiManager.MulticastLock? = null
     
     var webrtcManager: WebRTCManager? = null
         private set
@@ -43,6 +46,8 @@ class LinkService : Service() {
         super.onCreate()
         Log.d(tag, "Service Creating")
         notificationHelper = NotificationHelper(this)
+
+        acquireMulticastLock()
         
         val notification = notificationHelper.getServiceNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -88,6 +93,8 @@ class LinkService : Service() {
             override fun onAvailable(network: Network) {
                 Log.d(tag, "Network available, triggering DHT refresh")
                 webrtcManager?.publishMyAddress()
+                // Re-acquire lock if needed when network changes
+                acquireMulticastLock()
             }
 
             override fun onLost(network: Network) {
@@ -96,8 +103,38 @@ class LinkService : Service() {
         })
     }
 
+    private fun acquireMulticastLock() {
+        try {
+            if (multicastLock == null) {
+                val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                multicastLock = wifi.createMulticastLock("LinkDHTLock")
+                multicastLock?.setReferenceCounted(true)
+            }
+            multicastLock?.acquire()
+            Log.d(tag, "Multicast lock acquired")
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to acquire multicast lock: ${e.message}")
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(tag, "Multicast lock released")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error releasing multicast lock: ${e.message}")
+        }
+    }
+
     private fun initManager() {
         val database = AppDatabase.getDatabase(this)
+        val identityManager = LinkIdentityManager(this)
+        val myFingerprint = identityManager.fingerprint
+
         webrtcManager = WebRTCManager(
             context = this,
             messageDao = database.messageDao(),
@@ -117,10 +154,17 @@ class LinkService : Service() {
                 Log.d(tag, "WebRTC State: $state")
             }
         )
+        
+        // Initialize DHT with fingerprint
+        scope.launch {
+            val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
+            dhtNode.callAttr("initialize_dht", myFingerprint)
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseMulticastLock()
         webrtcManager?.destroy()
         job.cancel()
         Log.d(tag, "Service Destroyed")

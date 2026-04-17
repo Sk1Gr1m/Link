@@ -39,6 +39,7 @@ class WebRTCManager(
     private val peerConnectionFactory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
     private var dataChannel: DataChannel? = null
+    private var isDestroyed = false
 
     val myUsername get() = identityManager.username
     val myFingerprint get() = identityManager.fingerprint
@@ -84,40 +85,90 @@ class WebRTCManager(
         }
     }
 
-    fun updateUsername(newName: String) = identityManager.updateUsername(newName)
+    fun updateUsername(newName: String): Boolean = identityManager.updateUsername(newName)
 
     fun publishMyAddress() = signalingClient.publishAddress()
 
     fun renewConnection() {
-        // Run on main thread to avoid deadlocks during WebRTC callbacks
-        Handler(Looper.getMainLooper()).post {
-            peerFingerprint = null
-            prepareForNewConnection()
-            peerUsername = "Waiting for peer..."
-            connectionStatus = "Disconnected"
-            signalingClient.publishAddress()
-            onStateChanged?.invoke("Connection Reset")
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Handler(Looper.getMainLooper()).post { renewConnection() }
+            return
         }
+        peerFingerprint = null
+        prepareForNewConnection()
+        peerUsername = "Waiting for peer..."
+        connectionStatus = "Disconnected"
+        signalingClient.publishAddress()
+        onStateChanged?.invoke("Connection Reset")
     }
 
     private fun prepareForNewConnection() {
-        dataChannel?.unregisterObserver()
-        dataChannel?.dispose()
+        if (isDestroyed) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runBlocking(Dispatchers.Main) { prepareForNewConnection() }
+            return
+        }
+        dataChannel?.let {
+            it.unregisterObserver()
+            try {
+                it.dispose()
+            } catch (e: Exception) {
+                Log.e(tag, "Error disposing data channel: ${e.message}")
+            }
+        }
         dataChannel = null
+        protocol.setSession(null, null, null)
         
-        peerConnection?.close()
-        peerConnection?.dispose()
+        peerConnection?.let {
+            try {
+                it.close()
+                it.dispose()
+            } catch (e: Exception) {
+                Log.e(tag, "Error disposing peer connection: ${e.message}")
+            }
+        }
         peerConnection = null
         
-        peerConnection = createPeerConnection(createRtcConfig())
+        if (!isDestroyed) {
+            peerConnection = createPeerConnection(createRtcConfig())
+        }
         session = null
     }
 
     fun destroy() {
+        isDestroyed = true
         signalingClient.stop()
-        dataChannel?.dispose()
-        peerConnection?.dispose()
-        peerConnectionFactory.dispose()
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            disposeWebRTC()
+        } else {
+            runBlocking(Dispatchers.Main) { disposeWebRTC() }
+        }
+    }
+
+    private fun disposeWebRTC() {
+        dataChannel?.let {
+            it.unregisterObserver()
+            try {
+                it.dispose()
+            } catch (e: Exception) {
+                Log.e(tag, "Error disposing data channel in destroy: ${e.message}")
+            }
+        }
+        dataChannel = null
+        peerConnection?.let {
+            try {
+                it.close()
+                it.dispose()
+            } catch (e: Exception) {
+                Log.e(tag, "Error disposing peer connection in destroy: ${e.message}")
+            }
+        }
+        peerConnection = null
+        try {
+            peerConnectionFactory.dispose()
+        } catch (e: Exception) {
+            Log.e(tag, "Error disposing factory: ${e.message}")
+        }
     }
 
     private fun finishGathering() {
@@ -146,12 +197,15 @@ class WebRTCManager(
     }
 
     private fun createPeerConnection(config: PeerConnection.RTCConfiguration): PeerConnection? {
+        if (isDestroyed) return null
         return peerConnectionFactory.createPeerConnection(config, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate) {}
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+                if (isDestroyed) return
                 if (state == PeerConnection.IceGatheringState.COMPLETE) finishGathering()
             }
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+                if (isDestroyed) return
                 Log.d(tag, "ICE Connection State Changed: $state")
                 connectionStatus = when(state) {
                     PeerConnection.IceConnectionState.CONNECTED,
@@ -166,7 +220,10 @@ class WebRTCManager(
                 }
                 onStateChanged?.invoke(connectionStatus)
             }
-            override fun onDataChannel(dc: DataChannel) { setupDataChannel(dc) }
+            override fun onDataChannel(dc: DataChannel) { 
+                if (isDestroyed) return
+                setupDataChannel(dc) 
+            }
             override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
@@ -178,16 +235,21 @@ class WebRTCManager(
     }
 
     private fun setupDataChannel(dc: DataChannel) {
+        if (isDestroyed) return
         dataChannel = dc
         dc.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(p0: Long) {}
             override fun onStateChange() {
+                if (isDestroyed) return
                 if (dc.state() == DataChannel.State.OPEN) {
                     sendHandshake()
                     onStateChanged?.invoke("Data Channel Open")
                 }
             }
-            override fun onMessage(buffer: DataChannel.Buffer) { protocol.onReceive(buffer) }
+            override fun onMessage(buffer: DataChannel.Buffer) { 
+                if (isDestroyed) return
+                protocol.onReceive(buffer) 
+            }
         })
         protocol.setSession(session, dc, peerFingerprint)
     }
@@ -228,11 +290,23 @@ class WebRTCManager(
         try {
             val json = JSONObject(qrData)
             val type = json.getString("type")
-            peerUsername = json.getString("username")
+            val rawPeerUsername = json.optString("username", "")
+            peerUsername = identityManager.sanitizeUsername(rawPeerUsername).ifEmpty { "Peer" }
+
             val pubKeyHex = json.getString("id_key")
             val pubKey = hexToBytes(pubKeyHex)
             peerFingerprint = identityManager.getFingerprint(pubKey)
             
+            // Add peer as a DHT bootstrap node if address is present
+            val peerIp = json.optString("ip", "")
+            val peerDhtPort = json.optInt("dht_port", 0)
+            if (peerIp.isNotEmpty() && peerDhtPort != 0) {
+                scope.launch {
+                    val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
+                    dhtNode.callAttr("add_dht_bootstrap", peerIp, peerDhtPort)
+                }
+            }
+
             val sdp = json.getString("sdp")
             if (type == "offer") {
                 handleRemoteSdp(sdp, SessionDescription.Type.OFFER) { answerSdp ->
@@ -261,15 +335,26 @@ class WebRTCManager(
 
     fun getConnectionQrData(callback: (String) -> Unit) {
         createOffer { sdp ->
-            val json = JSONObject().apply {
-                put("type", "offer")
-                put("username", myUsername)
-                put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
-                put("sdp", sdp)
-            }
-            callback(json.toString())
-            signalingClient.watchPostBox { answerSdp ->
-                handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+            scope.launch {
+                val py = Python.getInstance()
+                val dhtNode = py.getModule("linkfront.dht_node")
+                val status = JSONObject(dhtNode.callAttr("get_dht_status").toString())
+                val myIp = status.optString("local_ip", "")
+                val dhtPort = status.optInt("listen_port", 0)
+
+                val json = JSONObject().apply {
+                    put("type", "offer")
+                    put("username", myUsername)
+                    put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
+                    put("sdp", thinSdp(sdp))
+                    put("ip", myIp)
+                    put("port", signalingClient.localPort)
+                    put("dht_port", dhtPort)
+                }
+                callback(json.toString())
+                signalingClient.watchPostBox { answerSdp ->
+                    handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                }
             }
         }
     }
@@ -299,13 +384,18 @@ class WebRTCManager(
 
     fun connectToPeerViaDHT(fingerprint: String) {
         scope.launch {
-            val address = signalingClient.lookupAddress(fingerprint)
-            if (address != null) {
+            val addresses = signalingClient.lookupAddress(fingerprint)
+            if (addresses.isNotEmpty()) {
                 createOffer { sdp ->
                     scope.launch {
-                        val answerSdp = signalingClient.sendOfferDirectly(address.first, address.second, sdp)
-                        if (answerSdp != null) {
-                            handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                        for ((ip, port) in addresses) {
+                            Log.d(tag, "Attempting direct offer to $ip:$port")
+                            val answerSdp = signalingClient.sendOfferDirectly(ip, port, sdp)
+                            if (answerSdp != null) {
+                                handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                                Log.d(tag, "Direct offer successful to $ip:$port")
+                                break
+                            }
                         }
                     }
                 }
@@ -322,7 +412,7 @@ class WebRTCManager(
         var peerUsernameReceived = "Unknown Peer"
         runBlocking {
             val existingPeer = peerDao.getPeerByFingerprint(fingerprint)
-            val incomingNameFromHandshake = json.optString("username", "")
+            val incomingNameFromHandshake = identityManager.sanitizeUsername(json.optString("username", ""))
             val fingerprintRegex = Regex("^([0-9A-F]{4}:){3}[0-9A-F]{4}.*")
             
             peerUsernameReceived = when {
@@ -333,7 +423,10 @@ class WebRTCManager(
                 existingPeer != null -> existingPeer.username
                 
                 // 3. If they sent a fingerprint as a name, sanitize it
-                fingerprintRegex.matches(incomingNameFromHandshake) -> "Peer ${fingerprint.take(8)}"
+                fingerprintRegex.matches(incomingNameFromHandshake) -> {
+                    val sanitized = identityManager.sanitizeUsername(incomingNameFromHandshake)
+                    if (fingerprintRegex.matches(sanitized)) "Peer ${fingerprint.take(8)}" else sanitized
+                }
                 
                 // 4. New peer, use their provided name or fallback
                 else -> incomingNameFromHandshake.ifEmpty { "Unknown Peer" }
@@ -362,7 +455,7 @@ class WebRTCManager(
     private fun completeHandshake(username: String, peerIdKey: ByteArray, peerEphemeralKey: ByteArray) {
         val crypto = Python.getInstance().getModule("linkfront.crypto")
         session = crypto.callAttr("establish_session", 
-            identityManager.identity?.callAttr("get_private_key_bytes"),
+            identityManager.identity?.callAttr("get_seed_bytes"),
             ephemeralPrivateKey,
             peerIdKey,
             peerEphemeralKey

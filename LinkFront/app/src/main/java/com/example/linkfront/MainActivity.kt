@@ -125,6 +125,7 @@ class MainActivity : ComponentActivity() {
                 ChatScreen(
                     webrtcManager = webrtcManager,
                     messageDao = messageDao,
+                    peerDao = peerDao,
                     fingerprint = fingerprint,
                     onBack = { navController.popBackStack() },
                     onClearHistory = {

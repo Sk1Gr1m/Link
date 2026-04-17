@@ -46,6 +46,7 @@ import java.util.*
 fun ChatScreen(
     webrtcManager: WebRTCManager?,
     messageDao: MessageDao,
+    peerDao: com.example.linkfront.PeerDao,
     fingerprint: String,
     onBack: () -> Unit,
     onClearHistory: () -> Unit
@@ -58,6 +59,8 @@ fun ChatScreen(
     }
 
     val messages by messageDao.getMessagesForPeer(fingerprint).collectAsState(initial = emptyList())
+    val peer by peerDao.getPeerFlowByFingerprint(fingerprint).collectAsState(initial = null)
+    
     val sortedMessages = remember(messages) { messages.sortedByDescending { it.id } }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -138,10 +141,62 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(webrtcManager?.connectionStatus, fingerprint) {
+    // Monitor DHT status globally in chat
+    var dhtConnected by remember { mutableStateOf(false) }
+    LaunchedEffect(webrtcManager) {
+        if (webrtcManager == null) return@LaunchedEffect
+        while (true) {
+            val statusJson = webrtcManager.getDhtStatus()
+            if (statusJson != null) {
+                try {
+                    val obj = org.json.JSONObject(statusJson)
+                    dhtConnected = obj.getBoolean("is_connected")
+                } catch (_: Exception) {}
+            }
+            kotlinx.coroutines.delay(5000)
+        }
+    }
+
+    LaunchedEffect(webrtcManager?.connectionStatus, webrtcManager?.peerFingerprint, fingerprint, dhtConnected) {
         if (fingerprint == "SELF") return@LaunchedEffect
-        while (webrtcManager?.connectionStatus == "Disconnected") {
-            webrtcManager.connectToPeerViaDHT(fingerprint)
+        
+        // 1. Connection Logic
+        // Immediate attempt if disconnected
+        if (webrtcManager != null && (webrtcManager.peerFingerprint != fingerprint || webrtcManager.connectionStatus == "Disconnected")) {
+            if (dhtConnected) {
+                webrtcManager.connectToPeerViaDHT(fingerprint)
+            }
+        }
+
+        // 2. Auto-Resend Logic
+        if (webrtcManager != null && webrtcManager.peerFingerprint == fingerprint && webrtcManager.connectionStatus == "Connected") {
+            val failedMessages = messageDao.getFailedMessagesForPeer(fingerprint)
+            if (failedMessages.isNotEmpty()) {
+                failedMessages.forEach { msg ->
+                    if (msg.messageType == "TEXT") {
+                        messageDao.deleteMessageById(msg.id)
+                        webrtcManager.sendEncrypted(fingerprint, msg.text)
+                    } else if (msg.messageType == "IMAGE" && msg.filePath != null) {
+                        val file = java.io.File(msg.filePath)
+                        if (file.exists()) {
+                            messageDao.deleteMessageById(msg.id)
+                            webrtcManager.sendImage(fingerprint, file.readBytes())
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Polling loop
+        while (true) {
+            val currentStatus = webrtcManager?.connectionStatus
+            val currentPeer = webrtcManager?.peerFingerprint
+            
+            if (currentPeer != fingerprint || currentStatus == "Disconnected") {
+                if (dhtConnected) {
+                    webrtcManager?.connectToPeerViaDHT(fingerprint)
+                }
+            }
             kotlinx.coroutines.delay(30000)
         }
     }
@@ -160,18 +215,30 @@ fun ChatScreen(
             TopAppBar(
                 title = {
                     Column {
-                        val title = if (fingerprint == "SELF") "My Notes"
-                                   else if (webrtcManager != null && webrtcManager.peerFingerprint == fingerprint) "Chat with ${webrtcManager.peerUsername}"
-                                   else "Secure Chat"
-                        val status = if (fingerprint == "SELF") "Local Only"
-                                    else if (webrtcManager != null && webrtcManager.peerFingerprint == fingerprint) webrtcManager.connectionStatus
-                                    else "Offline"
+                        val title = when {
+                            fingerprint == "SELF" -> "My Notes"
+                            webrtcManager != null && webrtcManager.peerFingerprint == fingerprint && webrtcManager.peerUsername != "Waiting for peer..." -> "Chat with ${webrtcManager.peerUsername}"
+                            peer != null -> "Chat with ${peer!!.username}"
+                            else -> "Secure Chat"
+                        }
+                        
+                        val status = when {
+                            fingerprint == "SELF" -> "Local Only"
+                            webrtcManager != null && webrtcManager.peerFingerprint == fingerprint -> webrtcManager.connectionStatus
+                            dhtConnected -> "Finding Peer..."
+                            else -> "DHT Disconnected"
+                        }
                         
                         Text(title, style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = status,
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (status == "Connected" || status == "Local Only") Color(0xFF4CAF50) else MaterialTheme.colorScheme.secondary
+                            color = when (status) {
+                                "Connected", "Local Only" -> Color(0xFF4CAF50)
+                                "Finding Peer...", "Connecting...", "Verifying..." -> Color(0xFFFF9800)
+                                "DHT Disconnected" -> MaterialTheme.colorScheme.error
+                                else -> MaterialTheme.colorScheme.secondary
+                            }
                         )
                     }
                 },
@@ -323,11 +390,12 @@ fun ChatBubble(
     }
 
     val bgColor = if (isMe) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer
-    val textColor = if (isMe) Color.White else MaterialTheme.colorScheme.onSecondaryContainer
+    val textColor = if (isMe) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .padding(vertical = 4.dp)
             .pointerInput(Unit) {
                 detectTapGestures(
                     onLongPress = { onLongClick() }
@@ -338,10 +406,10 @@ fun ChatBubble(
         Surface(
             color = bgColor,
             shape = bubbleShape,
-            tonalElevation = if (isMe) 2.dp else 0.dp,
-            modifier = Modifier.widthIn(max = 300.dp)
+            shadowElevation = 1.dp,
+            modifier = Modifier.widthIn(max = 320.dp)
         ) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 if (message.messageType == "IMAGE" && message.filePath != null) {
                     val bitmap = remember(message.filePath) {
                         try {
@@ -395,35 +463,28 @@ fun ChatBubble(
                     Text(
                         text = timeString,
                         style = MaterialTheme.typography.labelSmall,
-                        color = textColor.copy(alpha = 0.7f),
-                        modifier = Modifier.weight(1f, fill = false)
+                        color = textColor.copy(alpha = 0.6f)
                     )
                     if (isMe) {
-                        Spacer(modifier = Modifier.width(4.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
                         when (message.transferStatus) {
-                            "PENDING" -> Icon(
-                                Icons.Default.Refresh,
-                                contentDescription = "Pending",
-                                modifier = Modifier.size(12.dp),
-                                tint = textColor.copy(alpha = 0.7f)
+                            "PENDING" -> CircularProgressIndicator(
+                                modifier = Modifier.size(10.dp),
+                                strokeWidth = 1.5.dp,
+                                color = textColor.copy(alpha = 0.6f)
                             )
                             "DELIVERED" -> Icon(
                                 Icons.Default.CheckCircle,
                                 contentDescription = "Delivered",
-                                modifier = Modifier.size(12.dp),
-                                tint = Color(0xFF4CAF50)
+                                modifier = Modifier.size(14.dp),
+                                tint = if (isMe) Color(0xFFB9F6CA) else Color(0xFF4CAF50)
                             )
-                            "FAILED" -> IconButton(
-                                onClick = onRetry,
-                                modifier = Modifier.size(16.dp)
-                            ) {
-                                Icon(
-                                    Icons.Default.Warning,
-                                    contentDescription = "Retry",
-                                    modifier = Modifier.size(14.dp),
-                                    tint = MaterialTheme.colorScheme.error
-                                )
-                            }
+                            "FAILED" -> Icon(
+                                Icons.Default.Warning,
+                                contentDescription = "Failed",
+                                modifier = Modifier.size(14.dp),
+                                tint = MaterialTheme.colorScheme.error
+                            )
                         }
                     }
                 }

@@ -23,7 +23,8 @@ class LinkIdentityManager(private val context: Context) {
 
     init {
         val prefs = context.getSharedPreferences("link_identity", Context.MODE_PRIVATE)
-        username = prefs.getString("my_username", "UnknownUser") ?: "UnknownUser"
+        val savedUsername = prefs.getString("my_username", "User") ?: "User"
+        username = sanitizeUsername(savedUsername).ifEmpty { "User" }
         
         val privateKeyHex = prefs.getString("private_key_hex", null)
         if (privateKeyHex != null) {
@@ -39,11 +40,31 @@ class LinkIdentityManager(private val context: Context) {
         fingerprint = calculateFingerprint()
     }
 
-    fun updateUsername(newName: String) {
-        username = newName
+    fun updateUsername(newName: String): Boolean {
+        val sanitized = sanitizeUsername(newName)
+        if (sanitized.isEmpty()) return false
+        
+        username = sanitized
         context.getSharedPreferences("link_identity", Context.MODE_PRIVATE).edit {
-            putString("my_username", newName)
+            putString("my_username", sanitized)
         }
+        return true
+    }
+
+    fun sanitizeUsername(name: String): String {
+        // 1. Remove control characters and leading/trailing whitespace
+        var sanitized = name.trim().filter { it.code >= 32 }
+        
+        // 2. Limit length (e.g., 32 characters)
+        if (sanitized.length > 32) sanitized = sanitized.take(32)
+        
+        // 3. Prevent names that look like fingerprints (HEX:HEX:HEX:HEX)
+        val fingerprintRegex = Regex("^([0-9A-F]{4}:){3}[0-9A-F]{4}.*", RegexOption.IGNORE_CASE)
+        if (fingerprintRegex.matches(sanitized)) {
+            return "User_" + sanitized.take(4)
+        }
+        
+        return sanitized
     }
 
     private fun calculateFingerprint(key: ByteArray? = null): String {

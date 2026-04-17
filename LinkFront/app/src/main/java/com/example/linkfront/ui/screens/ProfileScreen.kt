@@ -39,16 +39,19 @@ fun ProfileScreen(
     var dhtStatus by remember { mutableStateOf("Checking DHT...") }
     val scrollState = rememberScrollState()
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(webrtcManager) {
+        if (webrtcManager == null) return@LaunchedEffect
         while (true) {
-            val statusJson = webrtcManager?.getDhtStatus()
+            val statusJson = webrtcManager.getDhtStatus()
             if (statusJson != null) {
                 try {
                     val obj = org.json.JSONObject(statusJson)
                     val isConnected = obj.getBoolean("is_connected")
                     val neighbors = obj.getInt("neighbor_count")
                     dhtStatus = if (isConnected) "DHT Connected ($neighbors nodes)" else "DHT Disconnected"
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    android.util.Log.e("ProfileScreen", "Status JSON error: ${e.message}")
+                }
             }
             kotlinx.coroutines.delay(5000)
         }
@@ -120,14 +123,26 @@ fun ProfileScreen(
 
             OutlinedTextField(
                 value = tempUsername,
-                onValueChange = { tempUsername = it },
+                onValueChange = { 
+                    // Allow typing, but we will sanitize on save
+                    tempUsername = it 
+                },
                 label = { Text("Your Username") },
+                placeholder = { Text("Enter a safe username") },
+                supportingText = {
+                    Text("Max 32 characters. No control characters. Cannot look like a fingerprint.")
+                },
                 modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
                 trailingIcon = {
                     if (tempUsername != webrtcManager?.myUsername) {
-                        TextButton(onClick = { webrtcManager?.updateUsername(tempUsername) }) {
-                            // Ideally we'd have a callback to refresh state if needed, 
-                            // but WebRTCManager should handle the update.
+                        TextButton(onClick = { 
+                            val success = webrtcManager?.updateUsername(tempUsername) ?: false
+                            if (!success) {
+                                // Reset to current valid username if update failed
+                                tempUsername = webrtcManager?.myUsername ?: ""
+                            }
+                        }) {
                             Text("Save")
                         }
                     }

@@ -5,11 +5,14 @@ import urllib.error
 import json
 import socket
 import threading
+import ssl
+import time
+import hashlib
 from kademlia.network import Server
 
 # Configure logging
-logging.getLogger("kademlia").setLevel(logging.WARNING)
-logging.getLogger("rpcudp").setLevel(logging.WARNING)
+logging.getLogger("kademlia").setLevel(logging.INFO)
+logging.getLogger("rpcudp").setLevel(logging.INFO)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DHTNode")
@@ -27,31 +30,50 @@ def _start_background_loop(loop):
 _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
 _loop_thread.start()
 
-def run_async(coro):
-    """Utility to run a coroutine in the background event loop and wait for result."""
+def run_async(coro, timeout=30):
+    if threading.current_thread() is _loop_thread:
+        return None
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
     try:
-        return future.result(timeout=30)
-    except asyncio.TimeoutError:
-        logger.error("Coroutine timed out")
-        return None
+        return future.result(timeout=timeout)
     except Exception as e:
-        logger.error(f"Coroutine failed: {e}")
+        logger.error(f"Coroutine failed or timed out: {e}")
         return None
 
+_ip_cache = {"public": None, "local": None, "last_check": 0}
+
 def get_public_ip():
+    now = time.time()
+    if _ip_cache["public"] and (now - _ip_cache["last_check"] < 300):
+        return _ip_cache["public"]
+    
     urls = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]
+    ctx = ssl._create_unverified_context()
     for url in urls:
         try:
-            logger.info(f"Fetching public IP from {url}")
-            with urllib.request.urlopen(url, timeout=5) as response:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as response:
                 ip = response.read().decode("utf-8").strip()
-                logger.info(f"Public IP: {ip}")
-                return ip
-        except Exception as e:
-            logger.warning(f"Failed to fetch IP from {url}: {e}")
+                if ip and ip != "Checking...":
+                    _ip_cache["public"] = ip
+                    _ip_cache["last_check"] = now
+                    return ip
+        except:
             continue
-    return None
+    return _ip_cache["public"]
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and ip != "Checking...":
+            _ip_cache["local"] = ip
+            return ip
+    except:
+        pass
+    return "127.0.0.1"
 
 class DHTNode:
     _instance = None
@@ -61,28 +83,64 @@ class DHTNode:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super(DHTNode, cls).__new__(cls)
-                cls._instance.server = Server()
+                cls._instance.server = None 
                 cls._instance.is_connected = False
                 cls._instance.bootstrap_lock = asyncio.Lock()
+                cls._instance.extra_bootstrap_nodes = set()
+                cls._instance.last_bootstrap_attempt = 0
+                cls._instance.started = False
+                cls._instance.my_fingerprint = None
+                cls._instance.broadcast_port = 8467
             return cls._instance
 
-    async def _bootstrap(self):
-        async with self.bootstrap_lock:
-            # Check if protocol exists before calling bootstrappable_neighbors
-            if self.server.protocol:
-                neighbors = self.server.bootstrappable_neighbors()
-                if neighbors:
-                    self.is_connected = True
-                    return
+    def initialize(self, fingerprint):
+        if not fingerprint:
+            logger.error("Cannot initialize DHT with empty fingerprint")
+            return
+        self.my_fingerprint = fingerprint
+        if not self.started:
+            asyncio.run_coroutine_threadsafe(self._start_internal(), _loop)
 
+    async def _start_internal(self):
+        if self.started: return
+        try:
+            logger.info(f"Initializing DHT for fingerprint: {self.my_fingerprint}")
+            # Use stable node ID derived from fingerprint
+            node_id = hashlib.sha1(self.my_fingerprint.encode()).digest()
+            self.server = Server(node_id=node_id)
+            
+            # Try a range of ports
+            for port in [8468, 6881, 3478, 5060, 0]:
+                try:
+                    await self.server.listen(port)
+                    logger.info(f"DHT listening on port {port}")
+                    self.started = True
+                    break
+                except:
+                    continue
+            
+            if self.started:
+                # Start background tasks
+                asyncio.create_task(self._bootstrap_loop())
+                asyncio.create_task(self._broadcast_loop())
+                asyncio.create_task(self._listen_broadcast_loop())
+        except Exception as e:
+            logger.error(f"DHT start error: {e}")
+
+    async def _bootstrap_loop(self):
+        while True:
+            await self._bootstrap()
+            delay = 30 if not self.is_connected else 300
+            await asyncio.sleep(delay)
+
+    async def _bootstrap(self, force=False):
+        async with self.bootstrap_lock:
+            now = time.time()
+            if not force and self.is_connected and (now - self.last_bootstrap_attempt < 300):
+                return
+            
+            self.last_bootstrap_attempt = now
             try:
-                # Start listening if not already doing so
-                if not self.server.protocol:
-                    # Listen on a fixed port if possible to help with NAT, 
-                    # but 0 is safer for avoiding "address in use"
-                    await self.server.listen(8468) 
-                
-                logger.info("Bootstrapping DHT node...")
                 bootstrap_nodes = [
                     ("router.bittorrent.com", 6881),
                     ("router.utorrent.com", 6881),
@@ -90,144 +148,201 @@ class DHTNode:
                     ("dht.libtorrent.org", 25401),
                     ("router.silotis.us", 6881),
                     ("dht.aelitis.com", 6881),
-                    ("router.bitcomet.com", 6881),
                 ]
                 
-                # Resolve hostnames first
                 resolved_nodes = []
                 for host, port in bootstrap_nodes:
                     try:
                         ip = await _loop.run_in_executor(None, lambda: socket.gethostbyname(host))
                         resolved_nodes.append((ip, port))
-                    except Exception as e:
-                        # Silencing resolution errors as they are expected for some public bootstrap nodes
+                    except:
                         pass
 
-                # Stable IP-based DHT nodes (Mainline DHT)
                 stable_ips = [
-                    ("67.215.246.10", 6881),   # OpenDNS/Cisco
-                    ("82.221.139.222", 6881),  # transmissionbt.com
-                    ("212.129.33.59", 6881),   # router.bittorrent.com
-                    ("87.98.162.88", 6881),    # Debian / Various
-                    ("52.58.153.216", 6881),   # libtorrent node
-                    ("151.80.120.114", 6881),
-                    ("174.129.43.20", 6881),
-                    ("192.121.121.14", 6881),  
-                    ("2.16.204.13", 6881),
-                    ("212.129.33.50", 6881),
-                    ("82.221.103.244", 6881),
-                    ("185.157.221.247", 25401),
-                    ("1.1.1.1", 6881), # Cloudflare (placeholder, won't work but for testing)
+                    ("67.215.246.10", 6881), ("82.221.139.222", 6881),
+                    ("212.129.33.59", 6881), ("87.98.162.88", 6881),
+                    ("151.80.120.114", 6881), ("212.129.33.50", 6881)
                 ]
+                for node in stable_ips:
+                    if node not in resolved_nodes: resolved_nodes.append(node)
 
-                # Use a specific known-working node if others fail
-                # For Link project, we should ideally have our own bootstrap nodes
-                # Adding some more common ones from known DHT lists
-                extra_nodes = [
-                    ("62.210.198.161", 6881),
-                    ("212.129.33.52", 6881),
-                    ("185.157.221.245", 25401),
-                ]
-                stable_ips.extend(extra_nodes)
-                
-                # Check if we can reach any stable IP via a quick ping-like check
-                for ip, port in stable_ips:
-                    resolved_nodes.append((ip, port))
+                for node in self.extra_bootstrap_nodes:
+                    if node not in resolved_nodes: resolved_nodes.append(node)
 
-                if not resolved_nodes:
-                    logger.error("No bootstrap nodes available")
-                    return
+                if not resolved_nodes: return
 
-                # Perform bootstrap with resolved nodes
-                # Kademlia's bootstrap is async, let's give it some time
+                logger.info(f"Bootstrapping DHT with {len(resolved_nodes)} nodes")
                 await self.server.bootstrap(resolved_nodes)
                 
-                # Wait a bit for neighbors to respond
-                for _ in range(5):
-                    await asyncio.sleep(1)
+                # Check for success
+                for _ in range(3):
+                    await asyncio.sleep(2)
                     neighbors = self.server.bootstrappable_neighbors()
                     if neighbors:
                         self.is_connected = True
-                        logger.info(f"DHT Node connected with {len(neighbors)} neighbors")
+                        logger.info(f"DHT Connected with {len(neighbors)} neighbors")
                         return
                 
                 self.is_connected = False
-                logger.warning("DHT Bootstrap found no neighbors after waiting.")
-                    
             except Exception as e:
-                logger.error(f"DHT Bootstrap exception: {e}")
-                self.is_connected = False
-                # If 8468 fails, try random port
+                logger.error(f"DHT Bootstrap error: {e}")
+
+    async def _broadcast_loop(self):
+        """Periodically broadcast presence on the local network."""
+        while True:
+            if self.started and self.server.protocol:
                 try:
-                    await self.server.listen(0)
+                    port = self.server.protocol.transport.get_extra_info('sockname')[1]
+                    data = json.dumps({
+                        "type": "LINK_DISCOVERY",
+                        "fingerprint": self.my_fingerprint,
+                        "port": port
+                    }).encode()
+                    
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    # Broadcast to common subnets and global broadcast
+                    for broadcast_addr in ["255.255.255.255", "192.168.1.255", "192.168.0.255"]:
+                        try:
+                            sock.sendto(data, (broadcast_addr, self.broadcast_port))
+                        except:
+                            pass
+                    sock.close()
+                except Exception as e:
+                    logger.warning(f"Broadcast failed: {e}")
+            await asyncio.sleep(15)
+
+    async def _listen_broadcast_loop(self):
+        """Listen for presence broadcasts from other peers on the local network."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('', self.broadcast_port))
+            sock.setblocking(False)
+            logger.info(f"Listening for local broadcasts on port {self.broadcast_port}")
+            
+            while True:
+                try:
+                    data, addr = await _loop.run_in_executor(None, lambda: sock.recvfrom(1024))
+                    msg = json.loads(data.decode())
+                    if msg.get("type") == "LINK_DISCOVERY" and msg.get("fingerprint") != self.my_fingerprint:
+                        peer_ip = addr[0]
+                        peer_port = msg.get("port")
+                        logger.info(f"Discovered local peer via broadcast: {peer_ip}:{peer_port}")
+                        await self.add_bootstrap_node(peer_ip, peer_port)
+                except (BlockingIOError, json.JSONDecodeError):
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.warning(f"Broadcast listen error: {e}")
+                    await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Could not bind broadcast listener: {e}")
+            sock.close()
+
+    async def add_bootstrap_node(self, ip, port):
+        if not ip or not port: return
+        if ip == "Checking..." or ip == "0.0.0.0" or ip == "None": return
+        node_tuple = (ip, int(port))
+        if node_tuple not in self.extra_bootstrap_nodes:
+            logger.info(f"Adding manual bootstrap node: {ip}:{port}")
+            self.extra_bootstrap_nodes.add(node_tuple)
+            if self.started:
+                await self._bootstrap(force=True)
+
+    async def publish(self, key, value):
+        if not self.started: return False
+        try:
+            await self.server.set(key, value)
+            return True
+        except:
+            return False
+
+    async def lookup(self, key):
+        if not self.started: return None
+        try:
+            return await self.server.get(key)
+        except:
+            return None
+
+    def get_status_dict(self):
+        try:
+            neighbors = []
+            routing_table_size = 0
+            if self.server and self.server.protocol:
+                try:
+                    neighbors = self.server.bootstrappable_neighbors()
                 except:
                     pass
-
-    async def publish(self, fingerprint, address_json):
-        await self._bootstrap()
-        if self.is_connected:
-            await self.server.set(fingerprint, address_json)
-            logger.info(f"Published location for {fingerprint}")
-        else:
-            logger.error("Skipping publish: No DHT neighbors found")
-
-    async def lookup(self, fingerprint):
-        await self._bootstrap()
-        if self.is_connected:
-            result = await self.server.get(fingerprint)
-            return result
-        return None
-
-    def get_status(self):
-        try:
-            # Get the current routing table neighbors
-            neighbors = []
-            if self.server.protocol:
-                neighbors = self.server.bootstrappable_neighbors()
+                    
+                if self.server.protocol.router:
+                    try:
+                        routing_table_size = len(self.server.protocol.router.get_neighbors())
+                    except:
+                        pass
             
-            # If we have 0 neighbors but the server IS listening, 
-            # and we've been running for a while, it's a UDP block.
-            status = {
-                "is_connected": len(neighbors) > 0,
-                "neighbor_count": len(neighbors),
-                "protocol_listening": self.server.protocol is not None,
-                "udp_status": "OK" if len(neighbors) > 0 else "BLOCKED_OR_SEARCHING"
+            listen_port = None
+            protocol_listening = False
+            if self.server and self.server.protocol:
+                protocol_listening = True
+                if hasattr(self.server.protocol, 'transport') and self.server.protocol.transport:
+                    try:
+                        sockname = self.server.protocol.transport.get_extra_info('sockname')
+                        if sockname:
+                            listen_port = sockname[1]
+                    except:
+                        pass
+
+            connected = len(neighbors) > 0 or routing_table_size > 0
+
+            return {
+                "is_connected": connected,
+                "neighbor_count": max(len(neighbors), routing_table_size),
+                "protocol_listening": protocol_listening,
+                "listen_port": listen_port,
+                "local_ip": get_local_ip(),
+                "public_ip": _ip_cache["public"] or "Checking..."
             }
-            return status
         except Exception as e:
+            logger.error(f"Error in get_status_dict: {e}", exc_info=True)
             return {
                 "is_connected": False,
                 "neighbor_count": 0,
                 "protocol_listening": False,
+                "listen_port": None,
+                "local_ip": "127.0.0.1",
+                "public_ip": "Error",
                 "error": str(e)
             }
 
-# Wrapper functions for Chaquopy
+def initialize_dht(fingerprint):
+    DHTNode().initialize(fingerprint)
+
 def get_dht_status():
-    status = DHTNode().get_status()
-    return json.dumps(status)
+    return json.dumps(DHTNode().get_status_dict())
+
+def add_dht_bootstrap(ip, port):
+    run_async(DHTNode().add_bootstrap_node(ip, port))
 
 def put_value(key, value):
-    """Puts a generic string value into the DHT."""
-    try:
-        run_async(DHTNode().publish(key, value))
-        return True
-    except Exception as e:
-        logger.error(f"Failed to put to DHT: {e}")
-        return False
+    return run_async(DHTNode().publish(key, value)) or False
 
 def get_value(key):
-    """Gets a generic string value from the DHT."""
-    try:
-        result = run_async(DHTNode().lookup(key))
-        return result
-    except Exception as e:
-        logger.error(f"Failed to get from DHT: {e}")
-    return None
+    return run_async(DHTNode().lookup(key))
 
-def publish_address(fingerprint, ip, port):
-    address_json = json.dumps({"ip": ip, "port": int(port)})
-    put_value(fingerprint, address_json)
+def publish_address(fingerprint, public_ip, local_ip, port, dht_port=0):
+    if public_ip == "Checking..." or public_ip == "None":
+        public_ip = None
+    if local_ip == "Checking..." or local_ip == "0.0.0.0":
+        return False
+
+    data = {
+        "public_ip": public_ip if public_ip else "None",
+        "local_ip": local_ip,
+        "port": int(port),
+        "dht_port": int(dht_port),
+        "time": int(time.time())
+    }
+    return put_value(fingerprint, json.dumps(data))
         
 def lookup_address(fingerprint):
     result = get_value(fingerprint)

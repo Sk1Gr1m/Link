@@ -14,6 +14,7 @@ import org.webrtc.DataChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 
 class LinkProtocol(
     private val context: Context,
@@ -135,23 +136,26 @@ class LinkProtocol(
     }
 
     private fun encryptAndSend(json: JSONObject): Boolean {
-        val s = session ?: run {
-            Log.w(tag, "Cannot send packet: No session established")
-            return false
-        }
-        val dc = dataChannel ?: run {
-            Log.w(tag, "Cannot send packet: No data channel")
-            return false
-        }
-        if (dc.state() != DataChannel.State.OPEN) {
-            Log.w(tag, "Cannot send packet: Data channel state is ${dc.state()}")
+        val s = session
+        val dc = dataChannel
+        
+        if (s == null || dc == null) {
+            Log.w(tag, "Cannot send packet: No session or data channel")
             return false
         }
         
         return try {
+            val state = dc.state()
+            if (state != DataChannel.State.OPEN) {
+                Log.w(tag, "Cannot send packet: Data channel state is $state")
+                return false
+            }
             val encrypted = s.callAttr("encrypt", json.toString()).toJava(ByteArray::class.java)
             dc.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
             true
+        } catch (e: IllegalStateException) {
+            Log.e(tag, "DataChannel disposed or invalid state: ${e.message}")
+            false
         } catch (e: Exception) {
             Log.e(tag, "Encryption or transmission error: ${e.message}")
             false
@@ -165,7 +169,7 @@ class LinkProtocol(
         // 1. Try to handle unencrypted handshake
         if (session == null) {
             try {
-                val text = String(data, Charsets.UTF_8)
+                val text = String(data, StandardCharsets.UTF_8)
                 val json = JSONObject(text)
                 if (json.optString("type") == "handshake") {
                     // Handshake handling will be called from WebRTCManager for now 
