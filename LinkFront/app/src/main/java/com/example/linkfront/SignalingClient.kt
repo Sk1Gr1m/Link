@@ -11,7 +11,7 @@ import java.net.Socket
 class SignalingClient(
     private val identityManager: LinkIdentityManager,
     private val onOfferReceived: (String, (String) -> Unit) -> Unit,
-    private val onAnswerReceived: (String) -> Unit
+    private val onAnswerReceived: (String) -> Unit,
 ) {
     private val tag = "SignalingClient"
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -39,6 +39,9 @@ class SignalingClient(
                 localPort = serverSocket!!.localPort
                 Log.d(tag, "Listener started on port $localPort")
                 
+                // Fast-track: Publish address immediately once port is known
+                publishAddress()
+                
                 while (isActive) {
                     val client = serverSocket?.accept() ?: break
                     scope.launch {
@@ -53,8 +56,9 @@ class SignalingClient(
 
     private suspend fun handleClient(socket: Socket) {
         try {
-            val reader = socket.getInputStream().bufferedReader()
-            val input = reader.readLine() ?: return
+            val input = withContext(Dispatchers.IO) {
+                socket.getInputStream().bufferedReader().readLine()
+            } ?: return
             val json = JSONObject(input)
             val type = json.getString("type")
             val isEncrypted = json.optBoolean("encrypted", false)
@@ -80,13 +84,15 @@ class SignalingClient(
                         response.put("sdp", answer)
                         try {
                             if (socket.isConnected && !socket.isOutputShutdown) {
-                                socket.getOutputStream().write((response.toString() + "\n").toByteArray())
-                                socket.getOutputStream().flush()
+                                withContext(Dispatchers.IO) {
+                                    socket.getOutputStream().write((response.toString() + "\n").toByteArray())
+                                    socket.getOutputStream().flush()
+                                }
                             }
                         } catch (e: Exception) {
                             Log.e(tag, "Failed to send answer to socket: ${e.message}")
                         }
-                    } catch (e: TimeoutCancellationException) {
+                    } catch (_: TimeoutCancellationException) {
                         Log.e(tag, "Timed out waiting for WebRTC answer")
                     }
                 }
@@ -97,7 +103,9 @@ class SignalingClient(
         } catch (e: Exception) {
             Log.e(tag, "Error handling signal: ${e.message}")
         } finally {
-            socket.close()
+            withContext(Dispatchers.IO) {
+                socket.close()
+            }
         }
     }
 
@@ -120,11 +128,10 @@ class SignalingClient(
     }
 
     fun getDhtStatus(): String? {
-        val py = Python.getInstance()
         return try {
             val dhtNode = py.getModule("linkfront.dht_node")
             dhtNode.callAttr("get_dht_status").toString()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
@@ -139,7 +146,7 @@ class SignalingClient(
                 val dhtPort = status.optInt("listen_port", 0)
                 
                 // CRITICAL: Only publish if we have a real IP address and the DHT is listening
-                if (localIp != "0.0.0.0" && localIp != "127.0.0.1" && localIp != "Checking..." && dhtPort != 0) {
+                if ((localIp != "0.0.0.0") && (localIp != "127.0.0.1") && (localIp != "Checking...") && (dhtPort != 0)) {
                     val fingerprint = identityManager.fingerprint
                     if (localPort != 0) {
                         Log.i(tag, "Publishing address: $localIp:$localPort (DHT: $dhtPort)")
@@ -269,7 +276,7 @@ class SignalingClient(
     fun watchPostBox(callback: (String) -> Unit) {
         scope.launch {
             val postBoxKey = "answer_for_${identityManager.fingerprint}"
-            for (i in 1..60) {
+            repeat(60) {
                 val encrypted = linkModule.callAttr("get_value", postBoxKey)
                 if (encrypted != null && encrypted.toString() != "None") {
                     try {
@@ -279,7 +286,7 @@ class SignalingClient(
                         val decrypted = cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
                         callback(decrypted)
                         linkModule.callAttr("put_value", postBoxKey, "None")
-                        break
+                        return@launch
                     } catch (e: Exception) {
                         Log.e(tag, "Post box decrypt error: ${e.message}")
                     }

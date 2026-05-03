@@ -14,17 +14,9 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import com.chaquo.python.Python
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import org.json.JSONObject
 
 class LinkService : Service() {
     private val tag = "LinkService"
-    private val job = SupervisorJob()
-    private val scope = CoroutineScope(Dispatchers.IO + job)
     
     private lateinit var notificationHelper: NotificationHelper
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -51,7 +43,8 @@ class LinkService : Service() {
         
         val notification = notificationHelper.getServiceNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NotificationHelper.SERVICE_NOTIFICATION_ID, notification)
         }
@@ -84,7 +77,7 @@ class LinkService : Service() {
     }
 
     private fun registerNetworkCallback() {
-        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
@@ -135,6 +128,10 @@ class LinkService : Service() {
         val identityManager = LinkIdentityManager(this)
         val myFingerprint = identityManager.fingerprint
 
+        // Initialize DHT with fingerprint BEFORE manager starts
+        val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
+        dhtNode.callAttr("initialize_dht", myFingerprint)
+
         webrtcManager = WebRTCManager(
             context = this,
             messageDao = database.messageDao(),
@@ -154,19 +151,12 @@ class LinkService : Service() {
                 Log.d(tag, "WebRTC State: $state")
             }
         )
-        
-        // Initialize DHT with fingerprint
-        scope.launch {
-            val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
-            dhtNode.callAttr("initialize_dht", myFingerprint)
-        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         releaseMulticastLock()
         webrtcManager?.destroy()
-        job.cancel()
         Log.d(tag, "Service Destroyed")
     }
 }

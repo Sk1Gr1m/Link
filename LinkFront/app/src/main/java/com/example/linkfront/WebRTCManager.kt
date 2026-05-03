@@ -16,15 +16,14 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.webrtc.*
 import java.nio.ByteBuffer
-import java.nio.charset.StandardCharsets
 
 class WebRTCManager(
-    private val context: Context,
-    private val messageDao: MessageDao,
+    context: Context,
+    messageDao: MessageDao,
     private val peerDao: PeerDao,
     private val onConnectionRequest: (String, String, ByteArray, (Boolean) -> Unit) -> Unit,
     var onMessageReceived: ((String) -> Unit)? = null,
-    var onStateChanged: ((String) -> Unit)? = null
+    var onStateChanged: ((String) -> Unit)? = null,
 ) {
     private val tag = "WebRTCManager"
     private val scope = CoroutineScope(Dispatchers.IO)
@@ -32,9 +31,8 @@ class WebRTCManager(
     private val protocol = LinkProtocol(context, messageDao, scope, onMessageReceived)
     private val signalingClient = SignalingClient(
         identityManager,
-        onOfferReceived = { sdp, callback -> handleRemoteSdp(sdp, SessionDescription.Type.OFFER, callback) },
-        onAnswerReceived = { sdp -> handleRemoteSdp(sdp, SessionDescription.Type.ANSWER, null) }
-    )
+        onOfferReceived = { sdp, callback -> handleRemoteSdp(sdp, SessionDescription.Type.OFFER, callback) }
+    ) { sdp -> handleRemoteSdp(sdp, SessionDescription.Type.ANSWER, null) }
 
     private val peerConnectionFactory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
@@ -56,7 +54,22 @@ class WebRTCManager(
     private var ephemeralPublicKey: ByteArray? = null
     private val trustedPeers = mutableMapOf<String, PeerIdentity>() // Key: Fingerprint
 
-    data class PeerIdentity(val publicKey: ByteArray, val createdAt: Long)
+    data class PeerIdentity(val publicKey: ByteArray, val createdAt: Long) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+            other as PeerIdentity
+            if (!publicKey.contentEquals(other.publicKey)) return false
+            if (createdAt != other.createdAt) return false
+            return true
+        }
+
+        override fun hashCode(): Int {
+            var result = publicKey.contentHashCode()
+            result = 31 * result + createdAt.hashCode()
+            return result
+        }
+    }
 
     private var onIceGatheringComplete: ((String) -> Unit)? = null
     private val gatheringHandler = Handler(Looper.getMainLooper())
@@ -209,7 +222,8 @@ class WebRTCManager(
                 Log.d(tag, "ICE Connection State Changed: $state")
                 connectionStatus = when(state) {
                     PeerConnection.IceConnectionState.CONNECTED,
-                    PeerConnection.IceConnectionState.COMPLETED -> "Verifying..."
+                    PeerConnection.IceConnectionState.COMPLETED ->
+                        "Verifying..."
                     PeerConnection.IceConnectionState.DISCONNECTED -> "Reconnecting..."
                     PeerConnection.IceConnectionState.FAILED,
                     PeerConnection.IceConnectionState.CLOSED -> {
@@ -263,8 +277,8 @@ class WebRTCManager(
         gatheringHandler.postDelayed(gatheringTimeoutRunnable, 5000)
 
         peerConnection?.createOffer(object : SimpleSdpObserver() {
-            override fun onCreateSuccess(desc: SessionDescription?) {
-                peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, desc)
+            override fun onCreateSuccess(p0: SessionDescription?) {
+                peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, p0)
             }
         }, MediaConstraints())
     }
@@ -277,8 +291,8 @@ class WebRTCManager(
                     onIceGatheringComplete = onAnswerReady
                     gatheringHandler.postDelayed(gatheringTimeoutRunnable, 5000)
                     peerConnection?.createAnswer(object : SimpleSdpObserver() {
-                        override fun onCreateSuccess(desc: SessionDescription?) {
-                            peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, desc)
+                        override fun onCreateSuccess(p0: SessionDescription?) {
+                            peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, p0)
                         }
                     }, MediaConstraints())
                 }
@@ -300,7 +314,7 @@ class WebRTCManager(
             // Add peer as a DHT bootstrap node if address is present
             val peerIp = json.optString("ip", "")
             val peerDhtPort = json.optInt("dht_port", 0)
-            if (peerIp.isNotEmpty() && peerDhtPort != 0) {
+            if (peerIp.isNotEmpty() && (peerDhtPort != 0)) {
                 scope.launch {
                     val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
                     dhtNode.callAttr("add_dht_bootstrap", peerIp, peerDhtPort)
