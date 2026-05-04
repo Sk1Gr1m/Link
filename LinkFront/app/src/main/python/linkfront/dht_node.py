@@ -148,6 +148,8 @@ class DHTNode:
                     ("dht.libtorrent.org", 25401),
                     ("router.silotis.us", 6881),
                     ("dht.aelitis.com", 6881),
+                    ("router.bitcomet.com", 6881),
+                    ("dht.anidex.info", 6881),
                 ]
                 
                 resolved_nodes = []
@@ -190,7 +192,7 @@ class DHTNode:
     async def _broadcast_loop(self):
         """Periodically broadcast presence on the local network."""
         while True:
-            if self.started and self.server.protocol:
+            if self.started and self.server and self.server.protocol:
                 try:
                     port = self.server.protocol.transport.get_extra_info('sockname')[1]
                     data = json.dumps({
@@ -201,16 +203,26 @@ class DHTNode:
                     
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                    # Broadcast to common subnets and global broadcast
-                    for broadcast_addr in ["255.255.255.255", "192.168.1.255", "192.168.0.255"]:
+
+                    broadcast_addrs = ["255.255.255.255"]
+                    local_ip = get_local_ip()
+                    if local_ip and local_ip != "127.0.0.1":
+                        parts = local_ip.split('.')
+                        if len(parts) == 4:
+                            broadcast_addrs.append(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+
+                    for addr in set(broadcast_addrs):
                         try:
-                            sock.sendto(data, (broadcast_addr, self.broadcast_port))
-                        except:
-                            pass
+                            sock.sendto(data, (addr, self.broadcast_port))
+                        except Exception as e:
+                            logger.debug(f"Failed to send broadcast to {addr}: {e}")
                     sock.close()
                 except Exception as e:
-                    logger.warning(f"Broadcast failed: {e}")
-            await asyncio.sleep(15)
+                    logger.warning(f"Broadcast loop error: {e}")
+
+            # Broadcast more frequently if not connected
+            delay = 10 if not self.is_connected else 30
+            await asyncio.sleep(delay)
 
     async def _listen_broadcast_loop(self):
         """Listen for presence broadcasts from other peers on the local network."""

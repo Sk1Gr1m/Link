@@ -222,7 +222,7 @@ class SignalingClient(
         }
     }
 
-    fun sendAnswer(fingerprint: String, answerSdp: String, peerPublicKey: ByteArray?) {
+    fun sendAnswer(fingerprint: String, answerSdp: String, peerPublicKey: ByteArray?, directIp: String? = null, directPort: Int = 0) {
         scope.launch {
             // 1. DHT Post Box
             val postBoxKey = "answer_for_$fingerprint"
@@ -237,31 +237,43 @@ class SignalingClient(
             }
 
             // 2. Direct Socket to all known addresses
-            val addresses = lookupAddress(fingerprint)
-            for ((ip, port) in addresses) {
-                try {
-                    val socket = Socket()
-                    socket.connect(java.net.InetSocketAddress(ip, port), 2000)
-                    val request = JSONObject()
-                    request.put("type", "answer")
-                    
-                    if (peerPublicKey != null) {
-                        val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey).toJava(ByteArray::class.java)
-                        val encryptedB64 = android.util.Base64.encodeToString(encrypted, android.util.Base64.NO_WRAP)
-                        request.put("sdp", encryptedB64)
-                        request.put("encrypted", true)
-                    } else {
-                        request.put("sdp", answerSdp)
-                        request.put("encrypted", false)
-                    }
-                    socket.getOutputStream().write((request.toString() + "\n").toByteArray())
-                    socket.getOutputStream().flush()
-                    socket.close()
-                    Log.d(tag, "Direct answer sent to $ip:$port")
-                    break // Successfully sent to one address
-                } catch (e: Exception) {
-                    Log.d(tag, "Direct answer failed for $ip:$port: ${e.message}")
+            val addresses = lookupAddress(fingerprint).toMutableList()
+            if (directIp != null && directPort != 0) {
+                if (addresses.none { it.first == directIp && it.second == directPort }) {
+                    addresses.add(0, directIp to directPort)
                 }
+            }
+
+            for ((ip, port) in addresses) {
+                var success = false
+                for (attempt in 1..3) {
+                    try {
+                        val socket = Socket()
+                        socket.connect(java.net.InetSocketAddress(ip, port), 3000)
+                        val request = JSONObject()
+                        request.put("type", "answer")
+                        
+                        if (peerPublicKey != null) {
+                            val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey).toJava(ByteArray::class.java)
+                            val encryptedB64 = android.util.Base64.encodeToString(encrypted, android.util.Base64.NO_WRAP)
+                            request.put("sdp", encryptedB64)
+                            request.put("encrypted", true)
+                        } else {
+                            request.put("sdp", answerSdp)
+                            request.put("encrypted", false)
+                        }
+                        socket.getOutputStream().write((request.toString() + "\n").toByteArray())
+                        socket.getOutputStream().flush()
+                        socket.close()
+                        Log.d(tag, "Direct answer sent to $ip:$port on attempt $attempt")
+                        success = true
+                        break
+                    } catch (e: Exception) {
+                        Log.d(tag, "Direct answer attempt $attempt failed for $ip:$port: ${e.message}")
+                        if (attempt < 3) delay(1000)
+                    }
+                }
+                if (success) break // Successfully sent to one address
             }
         }
     }
