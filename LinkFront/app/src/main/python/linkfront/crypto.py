@@ -5,24 +5,8 @@ from nacl.utils import random
 from nacl.hash import blake2b, generichash
 from nacl.encoding import RawEncoder
 from nacl.bindings import crypto_scalarmult
+from .session import Session
 import hashlib
-
-class Session:
-    def __init__(self, key):
-        if not isinstance(key, (bytes, bytearray)):
-            key = bytes(x & 0xff for x in key)
-        self.key = key
-        self.box = SecretBox(key)
-    
-    def encrypt(self, message_str):
-        if isinstance(message_str, str):
-            message_str = message_str.encode()
-        return bytes(self.box.encrypt(message_str))
-        
-    def decrypt(self, ciphertext):
-        if not isinstance(ciphertext, (bytes, bytearray)):
-            ciphertext = bytes(x & 0xff for x in ciphertext)
-        return self.box.decrypt(ciphertext).decode()
 
 def ensure_bytes(b):
     if b is None:

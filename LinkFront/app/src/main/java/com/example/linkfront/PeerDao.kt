@@ -23,6 +23,12 @@ interface PeerDao {
     @Query("SELECT * FROM peers WHERE fingerprint = :fingerprint")
     suspend fun getPeerByFingerprint(fingerprint: String): PeerEntity?
 
+    @Query("UPDATE peers SET sharedSecret = :secret, lastSentCounter = :sent, lastReceivedCounter = :received WHERE fingerprint = :fingerprint")
+    suspend fun updateSession(fingerprint: String, secret: ByteArray, sent: Int, received: Int)
+
+    @Query("UPDATE peers SET lastKnownIp = :ip, lastKnownPort = :port, lastSeen = :lastSeen WHERE fingerprint = :fingerprint")
+    suspend fun updateAddress(fingerprint: String, ip: String, port: Int, lastSeen: Long = System.currentTimeMillis())
+
     @Query("DELETE FROM peers")
     suspend fun deleteAll()
 }

@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets
 class LinkProtocol(
     private val context: Context,
     private val messageDao: MessageDao,
+    private val peerDao: PeerDao,
     private val scope: CoroutineScope,
     private val onMessageReceived: ((String) -> Unit)?
 ) {
@@ -138,6 +139,7 @@ class LinkProtocol(
     private fun encryptAndSend(json: JSONObject): Boolean {
         val s = session
         val dc = dataChannel
+        val fingerprint = peerFingerprint
         
         if (s == null || dc == null) {
             Log.w(tag, "Cannot send packet: No session or data channel")
@@ -152,6 +154,12 @@ class LinkProtocol(
             }
             val encrypted = s.callAttr("encrypt", json.toString()).toJava(ByteArray::class.java)
             dc.send(DataChannel.Buffer(ByteBuffer.wrap(encrypted), true))
+            
+            // Persist the new counter
+            if (fingerprint != null) {
+                saveSessionState(fingerprint, s)
+            }
+            
             true
         } catch (e: IllegalStateException) {
             Log.e(tag, "DataChannel disposed or invalid state: ${e.message}")
@@ -186,6 +194,13 @@ class LinkProtocol(
         val s = session ?: return
         try {
             val decrypted = s.callAttr("decrypt", data).toString()
+            val fingerprint = peerFingerprint
+            
+            // Persist the new last_seen counter
+            if (fingerprint != null) {
+                saveSessionState(fingerprint, s)
+            }
+
             val json = JSONObject(decrypted)
             when (json.getString("type")) {
                 "chat" -> handleChat(json)
@@ -194,6 +209,19 @@ class LinkProtocol(
             }
         } catch (e: Exception) {
             Log.e(tag, "Protocol decrypt error: ${e.message}")
+        }
+    }
+
+    private fun saveSessionState(fingerprint: String, s: PyObject) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val secret = s["shared_key"]?.toJava(ByteArray::class.java) ?: return@launch
+                val sent = s["counter"]?.toInt() ?: 0
+                val received = s["last_seen"]?.toInt() ?: -1
+                peerDao.updateSession(fingerprint, secret, sent, received)
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to save session state: ${e.message}")
+            }
         }
     }
 

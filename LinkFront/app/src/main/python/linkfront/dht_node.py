@@ -8,6 +8,8 @@ import threading
 import ssl
 import time
 import hashlib
+import os
+import pickle
 from kademlia.network import Server
 
 # Configure logging
@@ -93,11 +95,12 @@ class DHTNode:
                 cls._instance.broadcast_port = 8467
             return cls._instance
 
-    def initialize(self, fingerprint):
+    def initialize(self, fingerprint, storage_path=None):
         if not fingerprint:
             logger.error("Cannot initialize DHT with empty fingerprint")
             return
         self.my_fingerprint = fingerprint
+        self.storage_path = storage_path
         if not self.started:
             asyncio.run_coroutine_threadsafe(self._start_internal(), _loop)
 
@@ -120,12 +123,45 @@ class DHTNode:
                     continue
             
             if self.started:
+                # Load previous routing table if available
+                await self._load_state()
                 # Start background tasks
                 asyncio.create_task(self._bootstrap_loop())
                 asyncio.create_task(self._broadcast_loop())
                 asyncio.create_task(self._listen_broadcast_loop())
+                asyncio.create_task(self._save_state_loop())
         except Exception as e:
             logger.error(f"DHT start error: {e}")
+
+    async def _save_state_loop(self):
+        while True:
+            await asyncio.sleep(600)  # Save every 10 minutes
+            await self._save_state()
+
+    async def _save_state(self):
+        if not self.storage_path or not self.server:
+            return
+        try:
+            neighbors = self.server.bootstrappable_neighbors()
+            if neighbors:
+                with open(self.storage_path, "wb") as f:
+                    pickle.dump(neighbors, f)
+                logger.info(f"Saved {len(neighbors)} neighbors to {self.storage_path}")
+        except Exception as e:
+            logger.error(f"Failed to save DHT state: {e}")
+
+    async def _load_state(self):
+        if not self.storage_path or not os.path.exists(self.storage_path):
+            return
+        try:
+            with open(self.storage_path, "rb") as f:
+                neighbors = pickle.load(f)
+            if neighbors:
+                logger.info(f"Loading {len(neighbors)} neighbors from cache")
+                await self.server.bootstrap(neighbors)
+                self.is_connected = True
+        except Exception as e:
+            logger.error(f"Failed to load DHT state: {e}")
 
     async def _bootstrap_loop(self):
         while True:
@@ -326,8 +362,8 @@ class DHTNode:
                 "error": str(e)
             }
 
-def initialize_dht(fingerprint):
-    DHTNode().initialize(fingerprint)
+def initialize_dht(fingerprint, storage_path=None):
+    DHTNode().initialize(fingerprint, storage_path)
 
 def get_dht_status():
     return json.dumps(DHTNode().get_status_dict())
@@ -342,6 +378,13 @@ def get_value(key):
     return run_async(DHTNode().lookup(key))
 
 def publish_address(fingerprint, public_ip, local_ip, port, dht_port=0):
+    node = DHTNode()
+    if not node.started or not node.is_connected:
+        logger.warning("Delaying address publish: DHT not ready or not connected")
+        # Optional: We could start a background task to retry this later
+        # For now, SignalingClient.kt handles retries via heartbeat
+        return False
+
     if public_ip == "Checking..." or public_ip == "None":
         public_ip = None
     if local_ip == "Checking..." or local_ip == "0.0.0.0":

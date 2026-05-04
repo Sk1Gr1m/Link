@@ -29,7 +29,7 @@ class WebRTCManager(
     private val tag = "WebRTCManager"
     private val scope = CoroutineScope(Dispatchers.IO)
     private val identityManager = LinkIdentityManager(context)
-    private val protocol = LinkProtocol(context, messageDao, scope, onMessageReceived)
+    private val protocol = LinkProtocol(context, messageDao, peerDao, scope, onMessageReceived)
     private val signalingClient = SignalingClient(
         identityManager,
         onOfferReceived = { sdp, callback -> handleRemoteSdp(sdp, SessionDescription.Type.OFFER, callback) },
@@ -242,7 +242,27 @@ class WebRTCManager(
             override fun onStateChange() {
                 if (isDestroyed) return
                 if (dc.state() == DataChannel.State.OPEN) {
-                    sendHandshake()
+                    val currentFingerprint = peerFingerprint
+                    if (currentFingerprint != null) {
+                        scope.launch {
+                            val peer = peerDao.getPeerByFingerprint(currentFingerprint)
+                            if (peer?.sharedSecret != null) {
+                                Log.i(tag, "Resuming existing session for $currentFingerprint")
+                                val sessionModule = Python.getInstance().getModule("linkfront.session")
+                                session = sessionModule.callAttr("Session",
+                                    peer.sharedSecret, 
+                                    peer.lastSentCounter, 
+                                    peer.lastReceivedCounter
+                                )
+                                protocol.setSession(session, dc, currentFingerprint)
+                                onStateChanged?.invoke("Connected (Resumed)")
+                            } else {
+                                sendHandshake()
+                            }
+                        }
+                    } else {
+                        sendHandshake()
+                    }
                     onStateChanged?.invoke("Data Channel Open")
                 }
             }
@@ -271,6 +291,10 @@ class WebRTCManager(
 
     private fun handleRemoteSdp(sdp: String, type: SessionDescription.Type, onAnswerReady: ((String) -> Unit)?) {
         val desc = SessionDescription(type, sdp)
+        
+        // If we get a remote SDP, we can extract the candidate IP if needed, 
+        // but for now, let's just rely on the signaling address success.
+        
         peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
                 if (type == SessionDescription.Type.OFFER) {
@@ -308,10 +332,12 @@ class WebRTCManager(
             }
 
             val sdp = json.getString("sdp")
+            val offerId = json.optString("offer_id", "legacy")
+
             if (type == "offer") {
                 handleRemoteSdp(sdp, SessionDescription.Type.OFFER) { answerSdp ->
                     // 1. Try background signaling via DHT
-                    signalingClient.sendAnswer(peerFingerprint!!, answerSdp, pubKey)
+                    signalingClient.sendAnswer(peerFingerprint!!, answerSdp, pubKey, offerId = offerId)
                     
                     // 2. Prepare Answer JSON for manual QR fallback
                     val answerJson = JSONObject().apply {
@@ -319,6 +345,7 @@ class WebRTCManager(
                         put("username", myUsername)
                         put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
                         put("sdp", answerSdp)
+                        put("offer_id", offerId)
                     }
                     onAnswerReady?.invoke(answerJson.toString())
                 }
@@ -341,6 +368,7 @@ class WebRTCManager(
                 val status = JSONObject(dhtNode.callAttr("get_dht_status").toString())
                 val myIp = status.optString("local_ip", "")
                 val dhtPort = status.optInt("listen_port", 0)
+                val offerId = "qr_${System.currentTimeMillis()}"
 
                 val json = JSONObject().apply {
                     put("type", "offer")
@@ -350,9 +378,14 @@ class WebRTCManager(
                     put("ip", myIp)
                     put("port", signalingClient.localPort)
                     put("dht_port", dhtPort)
+                    put("offer_id", offerId)
                 }
                 callback(json.toString())
-                signalingClient.watchPostBox { answerSdp ->
+                
+                // Also broadcast the offer to the DHT for background discovery
+                signalingClient.sendOfferViaDHT(myFingerprint, thinSdp(sdp), identityManager.getPublicKeyBytes()!!, offerId) 
+
+                signalingClient.watchPostBox(offerId) { answerSdp ->
                     handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
                 }
             }
@@ -384,18 +417,38 @@ class WebRTCManager(
 
     fun connectToPeerViaDHT(fingerprint: String) {
         scope.launch {
-            val addresses = signalingClient.lookupAddress(fingerprint)
-            if (addresses.isNotEmpty()) {
-                createOffer { sdp ->
-                    scope.launch {
-                        for ((ip, port) in addresses) {
-                            Log.d(tag, "Attempting direct offer to $ip:$port")
-                            val answerSdp = signalingClient.sendOfferDirectly(ip, port, sdp)
-                            if (answerSdp != null) {
-                                handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
-                                Log.d(tag, "Direct offer successful to $ip:$port")
-                                break
-                            }
+            val peer = peerDao.getPeerByFingerprint(fingerprint) ?: return@launch
+            val peerPubKey = peer.identityKey
+            val offerId = "dht_${System.currentTimeMillis()}_${(1000..9999).random()}"
+
+            createOffer { sdp ->
+                // 1. Try DHT Signaling (Robust for NAT/WAN)
+                signalingClient.sendOfferViaDHT(fingerprint, sdp, peerPubKey, offerId)
+                
+                // 2. Poll for the answer in the Postbox
+                signalingClient.watchPostBox(offerId) { answerSdp ->
+                    handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                }
+
+                // 3. Simultaneously try direct TCP signaling (Fast for LAN/Cached)
+                scope.launch {
+                    val addresses = signalingClient.lookupAddress(fingerprint).toMutableList()
+                    
+                    // Add cached address if it exists
+                    if (peer.lastKnownIp != null && peer.lastKnownPort != 0) {
+                        if (addresses.none { it.first == peer.lastKnownIp && it.second == peer.lastKnownPort }) {
+                            addresses.add(0, peer.lastKnownIp to peer.lastKnownPort)
+                        }
+                    }
+
+                    for ((ip, port) in addresses) {
+                        Log.d(tag, "Attempting direct offer to $ip:$port")
+                        val answerSdp = signalingClient.sendOfferDirectly(ip, port, sdp, offerId)
+                        if (answerSdp != null) {
+                            // We found them! Update last seen address
+                            peerDao.updateAddress(fingerprint, ip, port)
+                            handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
+                            break
                         }
                     }
                 }
@@ -454,16 +507,31 @@ class WebRTCManager(
 
     private fun completeHandshake(username: String, peerIdKey: ByteArray, peerEphemeralKey: ByteArray) {
         val crypto = Python.getInstance().getModule("linkfront.crypto")
-        session = crypto.callAttr("establish_session", 
+        val sessionObj = crypto.callAttr("establish_session", 
             identityManager.identity?.callAttr("get_seed_bytes"),
             ephemeralPrivateKey,
             peerIdKey,
             peerEphemeralKey
         )
+        session = sessionObj
         peerFingerprint = identityManager.getFingerprint(peerIdKey)
+        val currentFingerprint = peerFingerprint!!
         peerUsername = username
         connectionStatus = "Connected"
-        protocol.setSession(session, dataChannel, peerFingerprint)
+        protocol.setSession(session, dataChannel, currentFingerprint)
+        
+        // Initial save of the shared secret
+        scope.launch(Dispatchers.IO) {
+            try {
+                val secret = sessionObj["shared_key"]?.toJava(ByteArray::class.java)
+                if (secret != null) {
+                    peerDao.updateSession(currentFingerprint, secret, 0, -1)
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to save initial session: ${e.message}")
+            }
+        }
+
         onStateChanged?.invoke("Connected")
     }
 

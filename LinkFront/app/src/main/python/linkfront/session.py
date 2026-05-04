@@ -2,14 +2,15 @@ from nacl.secret import SecretBox
 from nacl.utils import random
 
 class Session:
-    def __init__(self, key):
+    def __init__(self, key, counter=0, last_seen=-1):
         # Java's byte[] can come in as signed integers. 
         # Convert to unsigned bytes for PyNaCl.
         if not isinstance(key, (bytes, bytearray)):
             key = bytes(x & 0xff for x in key)
         self.box = SecretBox(key)
-        self.counter = 0
-        self.last_seen = -1
+        self.shared_key = key
+        self.counter = counter
+        self.last_seen = last_seen
 
     def encrypt(self, message):
         nonce = random(24)

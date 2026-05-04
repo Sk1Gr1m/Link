@@ -8,6 +8,11 @@ data class PeerEntity(
     @PrimaryKey val fingerprint: String, // Fingerprint is a unique identifier
     val username: String,
     val identityKey: ByteArray, // The long-term public key
+    val sharedSecret: ByteArray? = null,
+    val lastSentCounter: Int = 0,
+    val lastReceivedCounter: Int = -1,
+    val lastKnownIp: String? = null,
+    val lastKnownPort: Int = 0,
     val lastSeen: Long = System.currentTimeMillis()
 ) {
     override fun equals(other: Any?): Boolean {

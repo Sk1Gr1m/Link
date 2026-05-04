@@ -13,6 +13,10 @@ class SignalingClient(
     private val onOfferReceived: (String, (String) -> Unit) -> Unit,
     private val onAnswerReceived: (String) -> Unit
 ) {
+    companion object {
+        val PREFERRED_PORTS = listOf(8467, 8469, 8470)
+    }
+
     private val tag = "SignalingClient"
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val py = Python.getInstance()
@@ -23,8 +27,9 @@ class SignalingClient(
         private set
 
     fun start() {
-        startListener()
+        startListener() // Keep TCP for local fast-path
         startHeartbeat()
+        startOfferPoller() // New DHT-based signaling
     }
 
     fun stop() {
@@ -35,9 +40,30 @@ class SignalingClient(
     private fun startListener() {
         scope.launch {
             try {
-                serverSocket = ServerSocket(0)
-                localPort = serverSocket!!.localPort
-                Log.d(tag, "Listener started on port $localPort")
+                // Try preferred ports first
+                var success = false
+                for (port in PREFERRED_PORTS) {
+                    try {
+                        serverSocket = java.net.ServerSocket()
+                        serverSocket?.reuseAddress = true 
+                        serverSocket?.bind(java.net.InetSocketAddress(port))
+                        localPort = port
+                        success = true
+                        Log.d(tag, "Listener started on preferred port $localPort")
+                        break
+                    } catch (e: Exception) {
+                        serverSocket?.close()
+                        serverSocket = null
+                        continue
+                    }
+                }
+
+                if (!success) {
+                    serverSocket = java.net.ServerSocket(0)
+                    serverSocket?.reuseAddress = true
+                    localPort = serverSocket!!.localPort
+                    Log.d(tag, "Listener started on fallback port $localPort")
+                }
                 
                 while (isActive) {
                     val client = serverSocket?.accept() ?: break
@@ -69,6 +95,7 @@ class SignalingClient(
 
             when (type.lowercase()) {
                 "offer" -> {
+                    val offerId = json.optString("offer_id", "legacy")
                     val answerDeferred = CompletableDeferred<String>()
                     onOfferReceived(sdp) { answer ->
                         answerDeferred.complete(answer)
@@ -78,6 +105,7 @@ class SignalingClient(
                         val response = JSONObject()
                         response.put("type", "answer")
                         response.put("sdp", answer)
+                        response.put("offer_id", offerId)
                         try {
                             if (socket.isConnected && !socket.isOutputShutdown) {
                                 socket.getOutputStream().write((response.toString() + "\n").toByteArray())
@@ -101,6 +129,62 @@ class SignalingClient(
         }
     }
 
+    private fun startOfferPoller() {
+        scope.launch {
+            val offerBoxKey = "offer_for_${identityManager.fingerprint}"
+            while (isActive) {
+                try {
+                    val encryptedOffer = linkModule.callAttr("get_value", offerBoxKey)
+                    if (encryptedOffer != null && encryptedOffer.toString() != "None") {
+                        Log.d(tag, "Received Offer via DHT Postbox")
+                        
+                        val cryptoModule = py.getModule("linkfront.crypto")
+                        val myPrivKey = identityManager.identity?.callAttr("get_seed_bytes")
+                        val encryptedBytes = android.util.Base64.decode(encryptedOffer.toString(), android.util.Base64.DEFAULT)
+                        val decrypted = cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
+                        
+                        val offerJson = JSONObject(decrypted)
+                        val sdp = offerJson.getString("sdp")
+                        val offerId = offerJson.optString("offer_id", "legacy")
+
+                        // Consume the offer immediately
+                        linkModule.callAttr("put_value", offerBoxKey, "None")
+
+                        onOfferReceived(sdp) { answerSdp ->
+                            // Send answer back via DHT
+                            sendAnswer(identityManager.fingerprint, answerSdp, null, offerId = offerId)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "Offer poller error: ${e.message}")
+                }
+                delay(3000) // Poll every 3 seconds
+            }
+        }
+    }
+
+    fun sendOfferViaDHT(targetFingerprint: String, sdp: String, targetPublicKey: ByteArray, offerId: String) {
+        scope.launch {
+            val offerBoxKey = "offer_for_$targetFingerprint"
+            val cryptoModule = py.getModule("linkfront.crypto")
+            
+            try {
+                val packet = JSONObject().apply {
+                    put("sdp", sdp)
+                    put("offer_id", offerId)
+                }
+                
+                val encrypted = cryptoModule.callAttr("encrypt_for_peer", packet.toString(), targetPublicKey).toJava(ByteArray::class.java)
+                val encryptedB64 = android.util.Base64.encodeToString(encrypted, android.util.Base64.NO_WRAP)
+                
+                Log.d(tag, "Sending Offer $offerId to DHT Postbox for $targetFingerprint")
+                linkModule.callAttr("put_value", offerBoxKey, encryptedB64)
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to send offer via DHT: ${e.message}")
+            }
+        }
+    }
+
     private fun startHeartbeat() {
         scope.launch {
             var iterations = 0
@@ -108,11 +192,11 @@ class SignalingClient(
                 publishAddress()
                 
                 // First 60 seconds: publish every 5 seconds for fast discovery
-                // After that: every 5 minutes
+                // After that: every 2 minutes
                 if (iterations < 12) {
                     delay(5000)
                 } else {
-                    delay(5 * 60 * 1000)
+                    delay(2 * 60 * 1000)
                 }
                 iterations++
             }
@@ -168,8 +252,18 @@ class SignalingClient(
                     val localIp = map[PyObject.fromJava("local_ip")]?.toString()
 
                     if (signalingPort != 0) {
-                        if (publicIp != null && publicIp != "None") addresses.add(publicIp to signalingPort)
-                        if (localIp != null && localIp != "None") addresses.add(localIp to signalingPort)
+                        val ips = listOfNotNull(publicIp, localIp).filter { it != "None" }
+                        for (ip in ips) {
+                            // Add the explicitly published port first
+                            addresses.add(ip to signalingPort)
+                            
+                            // Speculatively add other preferred ports in case DHT is stale
+                            for (p in PREFERRED_PORTS) {
+                                if (p != signalingPort) {
+                                    addresses.add(ip to p)
+                                }
+                            }
+                        }
                     }
                     
                     // Also use the discovered DHT port to bootstrap our DHT
@@ -189,7 +283,7 @@ class SignalingClient(
         }
     }
 
-    suspend fun sendOfferDirectly(ip: String, port: Int, sdp: String): String? {
+    suspend fun sendOfferDirectly(ip: String, port: Int, sdp: String, offerId: String): String? {
         return withContext(Dispatchers.IO) {
             var lastError: String? = null
             for (attempt in 1..3) {
@@ -199,6 +293,7 @@ class SignalingClient(
                     val request = JSONObject().apply {
                         put("type", "offer")
                         put("sdp", sdp)
+                        put("offer_id", offerId)
                     }
                     socket.getOutputStream().write((request.toString() + "\n").toByteArray())
                     socket.getOutputStream().flush()
@@ -222,10 +317,10 @@ class SignalingClient(
         }
     }
 
-    fun sendAnswer(fingerprint: String, answerSdp: String, peerPublicKey: ByteArray?, directIp: String? = null, directPort: Int = 0) {
+    fun sendAnswer(fingerprint: String, answerSdp: String, peerPublicKey: ByteArray?, directIp: String? = null, directPort: Int = 0, offerId: String = "legacy") {
         scope.launch {
             // 1. DHT Post Box
-            val postBoxKey = "answer_for_$fingerprint"
+            val postBoxKey = if (offerId == "legacy") "answer_for_$fingerprint" else "answer_$offerId"
             val cryptoModule = py.getModule("linkfront.crypto")
             
             if (peerPublicKey != null) {
@@ -252,6 +347,7 @@ class SignalingClient(
                         socket.connect(java.net.InetSocketAddress(ip, port), 3000)
                         val request = JSONObject()
                         request.put("type", "answer")
+                        request.put("offer_id", offerId)
                         
                         if (peerPublicKey != null) {
                             val encrypted = cryptoModule.callAttr("encrypt_for_peer", answerSdp, peerPublicKey).toJava(ByteArray::class.java)
@@ -278,9 +374,9 @@ class SignalingClient(
         }
     }
 
-    fun watchPostBox(callback: (String) -> Unit) {
+    fun watchPostBox(offerId: String, callback: (String) -> Unit) {
         scope.launch {
-            val postBoxKey = "answer_for_${identityManager.fingerprint}"
+            val postBoxKey = "answer_$offerId"
             for (i in 1..60) {
                 val encrypted = linkModule.callAttr("get_value", postBoxKey)
                 if (encrypted != null && encrypted.toString() != "None") {

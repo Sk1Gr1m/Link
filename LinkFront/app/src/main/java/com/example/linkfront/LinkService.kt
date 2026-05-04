@@ -18,8 +18,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.io.File
 
 class LinkService : Service() {
     private val tag = "LinkService"
@@ -134,6 +136,7 @@ class LinkService : Service() {
         val database = AppDatabase.getDatabase(this)
         val identityManager = LinkIdentityManager(this)
         val myFingerprint = identityManager.fingerprint
+        val dhtCachePath = File(filesDir, "dht_neighbors.pkl").absolutePath
 
         webrtcManager = WebRTCManager(
             context = this,
@@ -155,10 +158,33 @@ class LinkService : Service() {
             }
         )
         
-        // Initialize DHT with fingerprint
+        // Initialize DHT with fingerprint and storage path
         scope.launch {
             val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
-            dhtNode.callAttr("initialize_dht", myFingerprint)
+            dhtNode.callAttr("initialize_dht", myFingerprint, dhtCachePath)
+            
+            // Wait for DHT to start listening and have neighbors before publishing
+            var attempts = 0
+            while (attempts < 30) {
+                val statusJson = dhtNode.callAttr("get_dht_status").toString()
+                val status = JSONObject(statusJson)
+                val listenPort = status.optInt("listen_port", 0)
+                val isConnected = status.optBoolean("is_connected", false)
+                
+                if (listenPort != 0 && isConnected) {
+                    Log.d(tag, "DHT ready and connected, publishing address")
+                    webrtcManager?.publishMyAddress()
+                    break
+                }
+                Log.d(tag, "Waiting for DHT... Port: $listenPort, Connected: $isConnected (Attempt $attempts)")
+                delay(2000)
+                attempts++
+            }
+            
+            if (attempts >= 30) {
+                Log.w(tag, "DHT initialization timed out, trying to publish anyway")
+                webrtcManager?.publishMyAddress()
+            }
         }
     }
 
