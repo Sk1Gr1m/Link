@@ -58,7 +58,7 @@ class LinkIdentityManager(private val context: Context) {
         // 2. Limit length (e.g., 32 characters)
         if (sanitized.length > 32) sanitized = sanitized.take(32)
         
-        // 3. Prevent names that look like fingerprints
+        // 3. Prevent names that look like fingerprints (HEX:HEX:HEX:HEX)
         val fingerprintRegex = Regex("^([0-9A-F]{4}:){3}[0-9A-F]{4}.*", RegexOption.IGNORE_CASE)
         if (fingerprintRegex.matches(sanitized)) {
             return "User_" + sanitized.take(4)
