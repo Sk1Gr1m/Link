@@ -1,18 +1,21 @@
 # Gradle files
 .gradle/
 build/
+*/build/
 
 # IDE files
 .idea/
 *.iml
 *.ipr
 *.iws
+.kotlin/
 
 # Android specific
 local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+*/.cxx/
 output.json
 
 # Python / Chaquopy
@@ -20,12 +23,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 .chaquopy/
+*/.chaquopy/
 
 # OS specific
 .DS_Store
 Thumbs.db
 
-# Module specific builds
-LinkFront/app/build/
-LinkFront/app/.cxx/
-LinkFront/app/.chaquopy/
+# Secrets
+*.jks
+*.keystore
+google-services.json

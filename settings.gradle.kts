@@ -26,6 +26,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "Link"
 
-// Using :Link as the module name for the app to match user's previous configuration
-include(":Link")
-project(":Link").projectDir = file("LinkFront/app")
+// Using :app as the module name for the app
+include(":app")
+project(":app").projectDir = file("LinkFront/app")
