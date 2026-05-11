@@ -180,19 +180,42 @@ class WebRTCManager(
     }
 
     private fun createRtcConfig(): PeerConnection.RTCConfiguration {
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443?transport=tcp")
-                .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer(),
-            PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
-                .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer()
+        val iceServers = mutableListOf<PeerConnection.IceServer>()
+        
+        val stunServers = listOf(
+            "stun:stun.l.google.com:19302",
+            "stun:stun1.l.google.com:19302",
+            "stun:stun2.l.google.com:19302",
+            "stun:stun.metered.ca:80"
         )
+        
+        stunServers.forEach { url ->
+            Log.d(tag, "Adding STUN server: $url")
+            iceServers.add(PeerConnection.IceServer.builder(url).createIceServer()) 
+        }
+
+        // Verify/Log TURN credentials
+        val turnUsername = "openrelayproject"
+        val turnPassword = "openrelayproject"
+        val turnServers = listOf(
+            "turn:openrelay.metered.ca:443?transport=tcp",
+            "turn:openrelay.metered.ca:443?transport=udp",
+            "turn:openrelay.metered.ca:80"
+        )
+
+        turnServers.forEach { url ->
+            Log.d(tag, "Configuring TURN: $url (User: $turnUsername)")
+            iceServers.add(
+                PeerConnection.IceServer.builder(url)
+                    .setUsername(turnUsername)
+                    .setPassword(turnPassword)
+                    .createIceServer()
+            )
+        }
+
         return PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            // Prioritize TURN if P2P is failing
         }
     }
 
@@ -344,7 +367,7 @@ class WebRTCManager(
                         put("type", "answer")
                         put("username", myUsername)
                         put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
-                        put("sdp", answerSdp)
+                        put("sdp", thinSdp(answerSdp))
                         put("offer_id", offerId)
                     }
                     onAnswerReady?.invoke(answerJson.toString())
@@ -536,6 +559,7 @@ class WebRTCManager(
     }
 
     private fun thinSdp(sdp: String): String {
+        val originalSize = sdp.length
         val lines = sdp.lines()
         val filtered = mutableListOf<String>()
         
@@ -544,25 +568,33 @@ class WebRTCManager(
             "v=", "o=", "s=", "t=", "c=", "a=group:", "a=msid-semantic:",
             "m=", "a=mid:", "a=setup:", "a=fingerprint:", "a=ice-ufrag:", "a=ice-pwd:",
             "a=candidate:", "a=sctpmap:", "a=sctp-port:", "a=max-message-size:",
-            "a=rtpmap:", "a=fmtp:", "a=rtcp-mux", "a=rtcp:"
+            "a=rtcp-mux"
         )
 
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
             
-            // Keep essential lines and anything not blacklisted
+            // Priority 1: Keep essential lines
             if (essentialPrefixes.any { trimmed.startsWith(it) }) {
                 filtered.add(trimmed)
-            } else {
-                // Skip large metadata that isn't strictly required for basic connectivity
-                val blacklist = listOf("a=extmap:", "a=msid:", "a=ssrc:", "a=max-ptime:", "a=ptime:", "a=rtcp-fb:")
-                if (!blacklist.any { trimmed.startsWith(it) }) {
-                    filtered.add(trimmed)
-                }
+                continue
             }
+            
+            // Priority 2: Skip blacklisted junk metadata
+            val blacklist = listOf("a=extmap:", "a=msid:", "a=ssrc:", "a=max-ptime:", "a=ptime:", "a=rtcp-fb:", "a=rid:", "a=simulcast:")
+            if (blacklist.any { trimmed.startsWith(it) }) continue
+            
+            // Priority 3: For Data Channel, we can skip most codec-related lines (rtpmap/fmtp) 
+            // unless they belong to the application m-line (usually they don't)
+            if (trimmed.startsWith("a=rtpmap:") || trimmed.startsWith("a=fmtp:")) continue
+            
+            // Keep anything else by default to avoid breaking SDP structure
+            filtered.add(trimmed)
         }
-        return filtered.joinToString("\r\n") + "\r\n"
+        val result = filtered.joinToString("\r\n") + "\r\n"
+        Log.i(tag, "SDP Thinned: $originalSize -> ${result.length} bytes")
+        return result
     }
 
     private fun hexToBytes(hex: String) = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
