@@ -18,8 +18,6 @@ import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
 import com.example.linkfront.ui.screens.ChatScreen
 import com.example.linkfront.ui.screens.HomeScreen
 import com.example.linkfront.ui.screens.ProfileScreen
@@ -69,10 +67,6 @@ class MainActivity : ComponentActivity() {
         database = AppDatabase.getDatabase(this)
         messageDao = database.messageDao()
         peerDao = database.peerDao()
-
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
-        }
 
         checkAndRequestPermissions()
 

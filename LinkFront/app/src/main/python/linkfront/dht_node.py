@@ -10,6 +10,7 @@ import time
 import hashlib
 import os
 import pickle
+import random
 from kademlia.network import Server
 
 # Configure logging
@@ -177,7 +178,7 @@ class DHTNode:
             
             self.last_bootstrap_attempt = now
             try:
-                bootstrap_nodes = [
+                public_nodes = [
                     ("router.bittorrent.com", 6881),
                     ("router.utorrent.com", 6881),
                     ("dht.transmissionbt.com", 6881),
@@ -186,10 +187,15 @@ class DHTNode:
                     ("dht.aelitis.com", 6881),
                     ("router.bitcomet.com", 6881),
                     ("dht.anidex.info", 6881),
+                    ("router.hyanat.com", 6881),
+                    ("dht.transmissionbt.com", 6881),
                 ]
                 
+                # Sample a few public nodes to avoid heavy traffic
+                sampled_public = random.sample(public_nodes, min(len(public_nodes), 7))
+                
                 resolved_nodes = []
-                for host, port in bootstrap_nodes:
+                for host, port in sampled_public:
                     try:
                         ip = await _loop.run_in_executor(None, lambda: socket.gethostbyname(host))
                         resolved_nodes.append((ip, port))
@@ -199,17 +205,26 @@ class DHTNode:
                 stable_ips = [
                     ("67.215.246.10", 6881), ("82.221.139.222", 6881),
                     ("212.129.33.59", 6881), ("87.98.162.88", 6881),
-                    ("151.80.120.114", 6881), ("212.129.33.50", 6881)
+                    ("151.80.120.114", 6881), ("212.129.33.50", 6881),
+                    ("82.221.139.222", 6881), ("67.215.246.10", 6881),
+                    ("212.129.33.50", 6881), ("151.80.120.114", 6881)
                 ]
-                for node in stable_ips:
-                    if node not in resolved_nodes: resolved_nodes.append(node)
+                # Sample stable IPs too
+                resolved_nodes.extend(random.sample(stable_ips, min(len(stable_ips), 5)))
 
-                for node in self.extra_bootstrap_nodes:
-                    if node not in resolved_nodes: resolved_nodes.append(node)
+                # PRIORITIZE EXTRA NODES (Trusted Peers)
+                # We add them multiple times or at the front to ensure they are tried
+                trusted_list = list(self.extra_bootstrap_nodes)
+                if trusted_list:
+                    logger.info(f"Adding {len(trusted_list)} trusted peers to bootstrap")
+                    # Add all trusted peers
+                    for node in trusted_list:
+                        if node not in resolved_nodes:
+                            resolved_nodes.insert(0, node)
 
                 if not resolved_nodes: return
 
-                logger.info(f"Bootstrapping DHT with {len(resolved_nodes)} nodes")
+                logger.info(f"Bootstrapping DHT with {len(resolved_nodes)} nodes (sampled)")
                 await self.server.bootstrap(resolved_nodes)
                 
                 # Check for success
@@ -379,11 +394,12 @@ def get_value(key):
 
 def publish_address(fingerprint, public_ip, local_ip, port, dht_port=0):
     node = DHTNode()
-    if not node.started or not node.is_connected:
-        logger.warning("Delaying address publish: DHT not ready or not connected")
-        # Optional: We could start a background task to retry this later
-        # For now, SignalingClient.kt handles retries via heartbeat
+    if not node.started:
+        logger.warning("Delaying address publish: DHT not started")
         return False
+    
+    if not node.is_connected:
+        logger.info("Attempting publish while DHT is still connecting...")
 
     if public_ip == "Checking..." or public_ip == "None":
         public_ip = None

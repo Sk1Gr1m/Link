@@ -85,6 +85,18 @@ class LinkService : Service() {
         return START_STICKY
     }
 
+    private fun isNetworkAvailable(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork ?: return false
+        val capabilities = cm.getNetworkCapabilities(network) ?: return false
+        
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+               (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+    }
+
     private fun registerNetworkCallback() {
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val request = NetworkRequest.Builder()
@@ -93,7 +105,15 @@ class LinkService : Service() {
 
         connectivityManager.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(tag, "Network available, triggering DHT refresh")
+                val caps = connectivityManager.getNetworkCapabilities(network)
+                val transport = when {
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "WiFi"
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "Cellular"
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "Ethernet"
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true -> "VPN"
+                    else -> "Unknown"
+                }
+                Log.d(tag, "Network available via $transport, triggering DHT refresh")
                 webrtcManager?.publishMyAddress()
                 // Re-acquire lock if needed when network changes
                 acquireMulticastLock()
@@ -160,12 +180,38 @@ class LinkService : Service() {
         
         // Initialize DHT with fingerprint and storage path
         scope.launch {
+            if (!isNetworkAvailable()) {
+                Log.w(tag, "No active network detected at startup. DHT will initialize but may fail to bootstrap immediately.")
+            }
+
             val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
             dhtNode.callAttr("initialize_dht", myFingerprint, dhtCachePath)
             
+            // FEED KNOWN PEERS into DHT bootstrap
+            try {
+                val peers = database.peerDao().getAllPeersOnce() 
+                peers.forEach { peer ->
+                    if (peer.lastKnownIp != null && peer.lastKnownPort != 0) {
+                        Log.d(tag, "Adding trusted peer ${peer.username} to DHT bootstrap: ${peer.lastKnownIp}")
+                        // We use the signaling port as a hint, or if we had a dedicated DHT port, we'd use that.
+                        // For now, signaling port + 1 is a common pattern in this app's logs.
+                        dhtNode.callAttr("add_dht_bootstrap", peer.lastKnownIp, peer.lastKnownPort + 1) 
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Error feeding known peers to DHT: ${e.message}")
+            }
+
             // Wait for DHT to start listening and have neighbors before publishing
             var attempts = 0
             while (attempts < 30) {
+                if (!isNetworkAvailable()) {
+                    Log.d(tag, "Waiting for network availability before publishing...")
+                    delay(5000)
+                    attempts++
+                    continue
+                }
+
                 val statusJson = dhtNode.callAttr("get_dht_status").toString()
                 val status = JSONObject(statusJson)
                 val listenPort = status.optInt("listen_port", 0)

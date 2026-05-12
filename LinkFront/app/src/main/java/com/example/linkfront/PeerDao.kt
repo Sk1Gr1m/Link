@@ -11,6 +11,9 @@ interface PeerDao {
     @Query("SELECT * FROM peers ORDER BY lastSeen DESC")
     fun getAllPeers(): Flow<List<PeerEntity>>
 
+    @Query("SELECT * FROM peers")
+    suspend fun getAllPeersOnce(): List<PeerEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(peer: PeerEntity)
 

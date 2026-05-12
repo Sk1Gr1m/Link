@@ -136,23 +136,48 @@ class SignalingClient(
                 try {
                     val encryptedOffer = linkModule.callAttr("get_value", offerBoxKey)
                     if (encryptedOffer != null && encryptedOffer.toString() != "None") {
-                        Log.d(tag, "Received Offer via DHT Postbox")
+                        val offerStr = encryptedOffer.toString()
+                        Log.d(tag, "Received Offer via DHT Postbox (len: ${offerStr.length})")
                         
                         val cryptoModule = py.getModule("linkfront.crypto")
                         val myPrivKey = identityManager.identity?.callAttr("get_seed_bytes")
-                        val encryptedBytes = android.util.Base64.decode(encryptedOffer.toString(), android.util.Base64.DEFAULT)
-                        val decrypted = cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
                         
-                        val offerJson = JSONObject(decrypted)
-                        val sdp = offerJson.getString("sdp")
-                        val offerId = offerJson.optString("offer_id", "legacy")
+                        val decrypted = try {
+                            val encryptedBytes = android.util.Base64.decode(offerStr, android.util.Base64.NO_WRAP)
+                            cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
+                        } catch (e: Exception) {
+                            Log.w(tag, "Failed to decrypt DHT offer, trying legacy plain-text: ${e.message}")
+                            offerStr
+                        }
+                        
+                        val offerJson = try {
+                            JSONObject(decrypted)
+                        } catch (e: Exception) {
+                            Log.e(tag, "Failed to parse DHT offer JSON: ${e.message}")
+                            null
+                        }
 
-                        // Consume the offer immediately
-                        linkModule.callAttr("put_value", offerBoxKey, "None")
+                        if (offerJson != null) {
+                            val sdp = offerJson.getString("sdp")
+                            val offerId = offerJson.optString("offer_id", "legacy")
+                            val senderFingerprint = offerJson.optString("sender_fingerprint", "")
+                            val senderIdKeyHex = offerJson.optString("sender_id_key", "")
 
-                        onOfferReceived(sdp) { answerSdp ->
-                            // Send answer back via DHT
-                            sendAnswer(identityManager.fingerprint, answerSdp, null, offerId = offerId)
+                            // Consume the offer immediately
+                            linkModule.callAttr("put_value", offerBoxKey, "None")
+
+                            if (senderFingerprint.isNotEmpty() && senderIdKeyHex.isNotEmpty()) {
+                                val senderIdKey = hexToBytes(senderIdKeyHex)
+                                onOfferReceived(sdp) { answerSdp ->
+                                    // Send answer back via DHT to the actual sender
+                                    sendAnswer(senderFingerprint, answerSdp, senderIdKey, offerId = offerId)
+                                }
+                            } else {
+                                onOfferReceived(sdp) { answerSdp ->
+                                    // Send answer back via DHT (legacy fallback)
+                                    sendAnswer(identityManager.fingerprint, answerSdp, null, offerId = offerId)
+                                }
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -172,6 +197,8 @@ class SignalingClient(
                 val packet = JSONObject().apply {
                     put("sdp", sdp)
                     put("offer_id", offerId)
+                    put("sender_fingerprint", identityManager.fingerprint)
+                    put("sender_id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
                 }
                 
                 val encrypted = cryptoModule.callAttr("encrypt_for_peer", packet.toString(), targetPublicKey).toJava(ByteArray::class.java)
@@ -184,6 +211,9 @@ class SignalingClient(
             }
         }
     }
+
+    private fun bytesToHex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
+    private fun hexToBytes(hex: String) = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
     private fun startHeartbeat() {
         scope.launch {
@@ -289,7 +319,7 @@ class SignalingClient(
             for (attempt in 1..3) {
                 try {
                     val socket = Socket()
-                    socket.connect(java.net.InetSocketAddress(ip, port), 3000)
+                    socket.connect(java.net.InetSocketAddress(ip, port), 5000)
                     val request = JSONObject().apply {
                         put("type", "offer")
                         put("sdp", sdp)
@@ -344,7 +374,7 @@ class SignalingClient(
                 for (attempt in 1..3) {
                     try {
                         val socket = Socket()
-                        socket.connect(java.net.InetSocketAddress(ip, port), 3000)
+                        socket.connect(java.net.InetSocketAddress(ip, port), 5000)
                         val request = JSONObject()
                         request.put("type", "answer")
                         request.put("offer_id", offerId)
@@ -378,18 +408,26 @@ class SignalingClient(
         scope.launch {
             val postBoxKey = "answer_$offerId"
             for (i in 1..60) {
-                val encrypted = linkModule.callAttr("get_value", postBoxKey)
-                if (encrypted != null && encrypted.toString() != "None") {
+                val result = linkModule.callAttr("get_value", postBoxKey)
+                if (result != null && result.toString() != "None") {
+                    val resultStr = result.toString()
                     try {
                         val cryptoModule = py.getModule("linkfront.crypto")
                         val myPrivKey = identityManager.identity?.callAttr("get_seed_bytes")
-                        val encryptedBytes = android.util.Base64.decode(encrypted.toString(), android.util.Base64.DEFAULT)
-                        val decrypted = cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
+                        
+                        val decrypted = try {
+                            val encryptedBytes = android.util.Base64.decode(resultStr, android.util.Base64.NO_WRAP)
+                            cryptoModule.callAttr("decrypt_with_my_key", encryptedBytes, myPrivKey).toString()
+                        } catch (e: Exception) {
+                            // Fallback to raw if decryption/decode fails
+                            resultStr
+                        }
+                        
                         callback(decrypted)
                         linkModule.callAttr("put_value", postBoxKey, "None")
                         break
                     } catch (e: Exception) {
-                        Log.e(tag, "Post box decrypt error: ${e.message}")
+                        Log.e(tag, "Post box handling error: ${e.message}")
                     }
                 }
                 delay(2000)

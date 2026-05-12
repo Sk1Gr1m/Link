@@ -173,9 +173,25 @@ class WebRTCManager(
 
     private fun finishGathering() {
         gatheringHandler.removeCallbacks(gatheringTimeoutRunnable)
-        peerConnection?.localDescription?.let {
-            onIceGatheringComplete?.invoke(thinSdp(it.description))
+        
+        // RE-QUERY local description to ensure we get the one with gathered candidates
+        val currentLocalDesc = peerConnection?.localDescription
+        val state = peerConnection?.iceGatheringState()
+        Log.d(tag, "Finishing gathering. ICE State: $state, Signaling State: ${peerConnection?.signalingState()}")
+        
+        currentLocalDesc?.let {
+            val sdp = it.description
+            val thinned = thinSdp(sdp)
+            
+            // Validate that we have candidates if we are finished gathering
+            if (!sdp.contains("a=candidate:")) {
+                Log.w(tag, "Gathering finished but NO candidates found in local description! SDP Length: ${sdp.length}")
+            }
+            
+            onIceGatheringComplete?.invoke(thinned)
             onIceGatheringComplete = null
+        } ?: run {
+            Log.e(tag, "Local description is null in finishGathering!")
         }
     }
 
@@ -186,11 +202,12 @@ class WebRTCManager(
             "stun:stun.l.google.com:19302",
             "stun:stun1.l.google.com:19302",
             "stun:stun2.l.google.com:19302",
+            "stun:stun3.l.google.com:19302",
+            "stun:stun4.l.google.com:19302",
             "stun:stun.metered.ca:80"
         )
         
         stunServers.forEach { url ->
-            Log.d(tag, "Adding STUN server: $url")
             iceServers.add(PeerConnection.IceServer.builder(url).createIceServer()) 
         }
 
@@ -200,11 +217,12 @@ class WebRTCManager(
         val turnServers = listOf(
             "turn:openrelay.metered.ca:443?transport=tcp",
             "turn:openrelay.metered.ca:443?transport=udp",
-            "turn:openrelay.metered.ca:80"
+            "turn:openrelay.metered.ca:80",
+            "turn:openrelay.metered.ca:443"
         )
 
         turnServers.forEach { url ->
-            Log.d(tag, "Configuring TURN: $url (User: $turnUsername)")
+            Log.d(tag, "Configuring TURN: $url")
             iceServers.add(
                 PeerConnection.IceServer.builder(url)
                     .setUsername(turnUsername)
@@ -215,16 +233,21 @@ class WebRTCManager(
 
         return PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+            iceCandidatePoolSize = 10
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
         }
     }
 
     private fun createPeerConnection(config: PeerConnection.RTCConfiguration): PeerConnection? {
         if (isDestroyed) return null
         return peerConnectionFactory.createPeerConnection(config, object : PeerConnection.Observer {
-            override fun onIceCandidate(candidate: IceCandidate) {}
+            override fun onIceCandidate(candidate: IceCandidate) {
+                Log.d(tag, "Local Candidate discovered: ${candidate.sdp}")
+            }
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 if (isDestroyed) return
+                Log.d(tag, "ICE Gathering State: $state")
                 if (state == PeerConnection.IceGatheringState.COMPLETE) finishGathering()
             }
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
@@ -236,7 +259,9 @@ class WebRTCManager(
                     PeerConnection.IceConnectionState.DISCONNECTED -> "Reconnecting..."
                     PeerConnection.IceConnectionState.FAILED,
                     PeerConnection.IceConnectionState.CLOSED -> {
-                        peerFingerprint?.let { renewConnection() }
+                        if (peerFingerprint != null && state == PeerConnection.IceConnectionState.FAILED) {
+                             renewConnection() 
+                        }
                         "Disconnected"
                     }
                     else -> "Connecting..."
@@ -264,6 +289,7 @@ class WebRTCManager(
             override fun onBufferedAmountChange(p0: Long) {}
             override fun onStateChange() {
                 if (isDestroyed) return
+                Log.d(tag, "Data Channel State: ${dc.state()}")
                 if (dc.state() == DataChannel.State.OPEN) {
                     val currentFingerprint = peerFingerprint
                     if (currentFingerprint != null) {
@@ -303,32 +329,66 @@ class WebRTCManager(
         dataChannel?.let { setupDataChannel(it) }
 
         onIceGatheringComplete = onSdpReady
-        gatheringHandler.postDelayed(gatheringTimeoutRunnable, 5000)
+        gatheringHandler.postDelayed(gatheringTimeoutRunnable, 15000)
 
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription?) {
-                peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, desc)
+                Log.d(tag, "Offer Created Successfully")
+                peerConnection?.setLocalDescription(object : SimpleSdpObserver() {
+                    override fun onSetFailure(p0: String?) {
+                        Log.e(tag, "SetLocalDescription Failed: $p0")
+                    }
+                }, desc)
             }
-        }, MediaConstraints())
+            override fun onCreateFailure(p0: String?) {
+                Log.e(tag, "CreateOffer Failed: $p0")
+            }
+        }, MediaConstraints().apply {
+            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+        })
     }
 
     private fun handleRemoteSdp(sdp: String, type: SessionDescription.Type, onAnswerReady: ((String) -> Unit)?) {
-        val desc = SessionDescription(type, sdp)
+        val currentState = peerConnection?.signalingState()
+        Log.d(tag, "Handling Remote SDP type: $type. Current state: $currentState")
         
-        // If we get a remote SDP, we can extract the candidate IP if needed, 
-        // but for now, let's just rely on the signaling address success.
+        if (type == SessionDescription.Type.ANSWER && currentState == PeerConnection.SignalingState.STABLE) {
+            Log.w(tag, "Received ANSWER while in STABLE state. Likely a race condition/duplicate. Ignoring.")
+            return
+        }
+
+        if (type == SessionDescription.Type.OFFER) {
+            prepareForNewConnection()
+        }
+        val desc = SessionDescription(type, sdp)
         
         peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
+                Log.d(tag, "SetRemoteDescription Success")
                 if (type == SessionDescription.Type.OFFER) {
                     onIceGatheringComplete = onAnswerReady
-                    gatheringHandler.postDelayed(gatheringTimeoutRunnable, 5000)
+                    gatheringHandler.postDelayed(gatheringTimeoutRunnable, 15000)
                     peerConnection?.createAnswer(object : SimpleSdpObserver() {
                         override fun onCreateSuccess(desc: SessionDescription?) {
-                            peerConnection?.setLocalDescription(object : SimpleSdpObserver() {}, desc)
+                            Log.d(tag, "Answer Created Successfully")
+                            peerConnection?.setLocalDescription(object : SimpleSdpObserver() {
+                                override fun onSetFailure(p0: String?) {
+                                    Log.e(tag, "SetLocalDescription Answer Failed: $p0")
+                                }
+                            }, desc)
                         }
-                    }, MediaConstraints())
+                        override fun onCreateFailure(p0: String?) {
+                            Log.e(tag, "CreateAnswer Failed: $p0")
+                        }
+                    }, MediaConstraints().apply {
+                        mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+                        mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                    })
                 }
+            }
+            override fun onSetFailure(p0: String?) {
+                Log.e(tag, "SetRemoteDescription Failed ($type): $p0")
             }
         }, desc)
     }
@@ -397,16 +457,13 @@ class WebRTCManager(
                     put("type", "offer")
                     put("username", myUsername)
                     put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
-                    put("sdp", thinSdp(sdp))
+                    put("sdp", sdp) // sdp is already thinned by createOffer's callback calling finishGathering which calls thinSdp
                     put("ip", myIp)
                     put("port", signalingClient.localPort)
                     put("dht_port", dhtPort)
                     put("offer_id", offerId)
                 }
                 callback(json.toString())
-                
-                // Also broadcast the offer to the DHT for background discovery
-                signalingClient.sendOfferViaDHT(myFingerprint, thinSdp(sdp), identityManager.getPublicKeyBytes()!!, offerId) 
 
                 signalingClient.watchPostBox(offerId) { answerSdp ->
                     handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, null)
@@ -456,6 +513,7 @@ class WebRTCManager(
                 // 3. Simultaneously try direct TCP signaling (Fast for LAN/Cached)
                 scope.launch {
                     val addresses = signalingClient.lookupAddress(fingerprint).toMutableList()
+                    Log.d(tag, "DHT Lookup for $fingerprint returned ${addresses.size} addresses")
                     
                     // Add cached address if it exists
                     if (peer.lastKnownIp != null && peer.lastKnownPort != 0) {
@@ -562,38 +620,42 @@ class WebRTCManager(
         val originalSize = sdp.length
         val lines = sdp.lines()
         val filtered = mutableListOf<String>()
+        var candidateCount = 0
         
-        // Essential attributes for WebRTC handshake and basic media
-        val essentialPrefixes = listOf(
-            "v=", "o=", "s=", "t=", "c=", "a=group:", "a=msid-semantic:",
-            "m=", "a=mid:", "a=setup:", "a=fingerprint:", "a=ice-ufrag:", "a=ice-pwd:",
-            "a=candidate:", "a=sctpmap:", "a=sctp-port:", "a=max-message-size:",
-            "a=rtcp-mux"
+        // We use a BLACKLIST approach instead of an allowlist to be much more robust.
+        // We only remove lines known to be large and unnecessary for DataChannel-only p2p.
+        val blacklist = listOf(
+            "a=extmap:", 
+            "a=msid:", 
+            "a=ssrc:", 
+            "a=max-ptime:", 
+            "a=ptime:", 
+            "a=rtcp-fb:", 
+            "a=rid:", 
+            "a=simulcast:",
+            "a=x-google-",
+            "a=fmtp:",    // Usually for codecs, unnecessary for SCTP
+            "a=rtpmap:",  // Usually for codecs, unnecessary for SCTP
+            "a=ssrc-group:",
+            "a=msid-semantic:",
+            "a=group:BUNDLE", // Often not needed for data-only
+            "a=mid:"          // Sometimes can be removed if only one channel
         )
 
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
             
-            // Priority 1: Keep essential lines
-            if (essentialPrefixes.any { trimmed.startsWith(it) }) {
-                filtered.add(trimmed)
-                continue
-            }
-            
-            // Priority 2: Skip blacklisted junk metadata
-            val blacklist = listOf("a=extmap:", "a=msid:", "a=ssrc:", "a=max-ptime:", "a=ptime:", "a=rtcp-fb:", "a=rid:", "a=simulcast:")
             if (blacklist.any { trimmed.startsWith(it) }) continue
             
-            // Priority 3: For Data Channel, we can skip most codec-related lines (rtpmap/fmtp) 
-            // unless they belong to the application m-line (usually they don't)
-            if (trimmed.startsWith("a=rtpmap:") || trimmed.startsWith("a=fmtp:")) continue
-            
-            // Keep anything else by default to avoid breaking SDP structure
+            if (trimmed.startsWith("a=candidate:")) {
+                candidateCount++
+            }
             filtered.add(trimmed)
         }
+
         val result = filtered.joinToString("\r\n") + "\r\n"
-        Log.i(tag, "SDP Thinned: $originalSize -> ${result.length} bytes")
+        Log.i(tag, "SDP Thinned: $originalSize -> ${result.length} bytes. Candidates: $candidateCount")
         return result
     }
 
