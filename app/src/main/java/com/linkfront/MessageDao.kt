@@ -1,0 +1,42 @@
+package com.linkfront
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.Query
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface MessageDao {
+    @Query("SELECT * FROM messages WHERE peerFingerprint = :fingerprint ORDER BY timestamp ASC")
+    fun getMessagesForPeer(fingerprint: String): Flow<List<MessageEntity>>
+
+    @Insert
+    suspend fun insert(message: MessageEntity): Long
+
+    @Query("DELETE FROM messages WHERE peerFingerprint = :fingerprint")
+    suspend fun deleteMessagesForPeer(fingerprint: String)
+
+    @Query("DELETE FROM messages WHERE id = :id")
+    suspend fun deleteMessageById(id: Int)
+
+    @Query("DELETE FROM messages")
+    suspend fun deleteAll()
+
+    @Query("UPDATE messages SET progress = :progress, transferStatus = :status, filePath = :filePath WHERE id = :id")
+    suspend fun updateTransferProgress(id: Int, progress: Int, status: String, filePath: String)
+
+    @Query("UPDATE messages SET transferStatus = :status WHERE id = :id")
+    suspend fun updateStatus(id: Int, status: String)
+
+    @Query("SELECT * FROM messages WHERE transferStatus = 'FAILED' AND peerFingerprint = :fingerprint")
+    suspend fun getFailedMessagesForPeer(fingerprint: String): List<MessageEntity>
+
+    @Query("SELECT * FROM messages WHERE transferStatus = 'PENDING' AND peerFingerprint = :fingerprint")
+    suspend fun getPendingMessagesForPeer(fingerprint: String): List<MessageEntity>
+
+    @Query("SELECT DISTINCT peerFingerprint FROM messages WHERE transferStatus = 'PENDING'")
+    suspend fun getPeersWithPendingMessages(): List<String>
+
+    @Query("UPDATE messages SET transferStatus = 'PENDING' WHERE id = :id")
+    suspend fun markAsPending(id: Int)
+}
