@@ -205,6 +205,7 @@ class DHTNode:
                     ("router.utorrent.com", 6881),
                     ("dht.transmissionbt.com", 6881),
                     ("router.silotis.us", 6881),
+                    ("router.hyanat.com", 6881),
                     ("bootstrap.jami.net", 4222),
                     ("bootstrap.jami.net", 4500),
                     ("bootstrap.jami.net", 80),

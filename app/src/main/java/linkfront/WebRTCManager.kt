@@ -41,6 +41,8 @@ class WebRTCManager(
     private var dataChannel: DataChannel? = null
     private var isDestroyed = false
     private var currentOfferId: String? = null
+    
+    private val queuedRemoteCandidates = mutableListOf<IceCandidate>()
 
     val myUsername get() = identityManager.username
     val myFingerprint get() = identityManager.fingerprint
@@ -69,6 +71,8 @@ class WebRTCManager(
     }
 
     init {
+        generateEphemeralKeys()
+        
         mainHandler.post {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
@@ -99,6 +103,28 @@ class WebRTCManager(
 
     private fun startPendingRetryLoop() {
         scope.launch {
+            // Give DHT and signaling a moment to stabilize
+            delay(8000)
+            
+            // ONE-TIME: Proactive sweep of recent peers on startup
+            if (isOnline() && connectionStatus == "Disconnected") {
+                val peers = peerDao.getAllPeersOnce()
+                val prioritizedPeers = peers.filter { it.fingerprint != "SELF" }
+                    .sortedByDescending { it.lastSeen }
+                    .take(3) // Try top 3 most recent
+                
+                if (prioritizedPeers.isNotEmpty()) {
+                    Log.d(tag, "Startup proactive reconnect for ${prioritizedPeers.size} peers")
+                    prioritizedPeers.forEach { peer ->
+                        if (connectionStatus == "Disconnected" || peerFingerprint != peer.fingerprint) {
+                            connectToPeerViaDHT(peer.fingerprint)
+                            // Stagger attempts to allow one to complete or timeout
+                            delay(15000) 
+                        }
+                    }
+                }
+            }
+
             while (!isDestroyed) {
                 if (isOnline()) {
                     val allPeersWithPending = messageDao.getPeersWithPendingMessages()
@@ -108,11 +134,12 @@ class WebRTCManager(
                             if (peerFingerprint != fingerprint || connectionStatus != "Connected") {
                                 Log.i(tag, "Background retry for $fingerprint")
                                 connectToPeerViaDHT(fingerprint)
+                                delay(10000) // Staggered retry
                             }
                         }
                     }
                 }
-                delay(60000) // Retry every minute
+                delay(45000)
             }
         }
     }
@@ -155,12 +182,30 @@ class WebRTCManager(
         }
     }
 
+    private fun generateEphemeralKeys() {
+        scope.launch {
+            try {
+                val crypto = Python.getInstance().getModule("linkfront.crypto")
+                val pair = crypto.callAttr("generate_ephemeral_keypair").toJava(Array<ByteArray>::class.java)
+                ephemeralPrivateKey = pair[0]
+                ephemeralPublicKey = pair[1]
+                Log.d(tag, "Ephemeral keys pre-generated.")
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to generate ephemeral keys: ${e.message}")
+            }
+        }
+    }
+
     private fun prepareForNewConnection() {
         if (isDestroyed) return
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post { prepareForNewConnection() }
             return
         }
+        
+        queuedRemoteCandidates.clear()
+        generateEphemeralKeys()
+        
         dataChannel?.let {
             it.unregisterObserver()
             try {
@@ -372,8 +417,14 @@ class WebRTCManager(
     private fun addIceCandidate(candidate: IceCandidate) {
         mainHandler.post {
             if (isDestroyed) return@post
-            Log.d(tag, "Adding remote ICE candidate: ${candidate.sdp}")
-            peerConnection?.addIceCandidate(candidate)
+            val pc = peerConnection
+            if (pc != null && pc.remoteDescription != null) {
+                Log.d(tag, "Adding remote ICE candidate: ${candidate.sdp}")
+                pc.addIceCandidate(candidate)
+            } else {
+                Log.d(tag, "Postponing ICE candidate (remote description not set)")
+                queuedRemoteCandidates.add(candidate)
+            }
         }
     }
 
@@ -450,6 +501,16 @@ class WebRTCManager(
                 override fun onSetSuccess() {
                     mainHandler.post {
                         Log.d(tag, "SetRemoteDescription Success")
+                        
+                        // Process queued candidates
+                        if (queuedRemoteCandidates.isNotEmpty()) {
+                            Log.i(tag, "Applying ${queuedRemoteCandidates.size} queued ICE candidates")
+                            queuedRemoteCandidates.forEach { 
+                                peerConnection?.addIceCandidate(it)
+                            }
+                            queuedRemoteCandidates.clear()
+                        }
+                        
                         if (type == SessionDescription.Type.OFFER) {
                             gatheringTimeoutReached = false
                             onIceGatheringComplete = onAnswerReady
@@ -599,21 +660,27 @@ class WebRTCManager(
     }
 
     private fun sendHandshake() {
-        scope.launch {
-            val crypto = Python.getInstance().getModule("linkfront.crypto")
-            val pair = crypto.callAttr("generate_ephemeral_keypair").toJava(Array<ByteArray>::class.java)
-            ephemeralPrivateKey = pair[0]
-            ephemeralPublicKey = pair[1]
-
-            val handshake = JSONObject().apply {
-                put("type", "handshake")
-                put("username", myUsername)
-                put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
-                put("ephemeral_key", bytesToHex(ephemeralPublicKey!!))
+        if (ephemeralPublicKey == null) {
+            Log.w(tag, "Handshake delayed: Ephemeral keys not ready.")
+            scope.launch {
+                var attempts = 0
+                while (ephemeralPublicKey == null && attempts < 10) {
+                    delay(200)
+                    attempts++
+                }
+                if (ephemeralPublicKey != null) sendHandshake()
             }
-            // Use a raw message for handshake
-            dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(handshake.toString().toByteArray()), false))
+            return
         }
+        
+        val handshake = JSONObject().apply {
+            put("type", "handshake")
+            put("username", myUsername)
+            put("id_key", bytesToHex(identityManager.getPublicKeyBytes()!!))
+            put("ephemeral_key", bytesToHex(ephemeralPublicKey!!))
+        }
+        // Use a raw message for handshake
+        dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(handshake.toString().toByteArray()), false))
     }
 
     // Protocol glue
@@ -641,8 +708,23 @@ class WebRTCManager(
             onStateChanged?.invoke("Offline")
             return
         }
+        
+        // Avoid redundant connection attempts
+        if (peerFingerprint == fingerprint && (connectionStatus == "Connected" || connectionStatus == "Connecting...")) {
+            Log.d(tag, "Already connecting/connected to $fingerprint. Skipping.")
+            return
+        }
+
         scope.launch {
             val peer = peerDao.getPeerByFingerprint(fingerprint) ?: return@launch
+            
+            // Set intent early to guide UI and avoid races
+            if (peerFingerprint != fingerprint) {
+                peerFingerprint = fingerprint
+                peerUsername = peer.username
+                connectionStatus = "Connecting..."
+            }
+
             val peerPubKey = peer.identityKey
             val offerId = "dht_${System.currentTimeMillis()}_${(1000..9999).random()}"
             currentOfferId = offerId

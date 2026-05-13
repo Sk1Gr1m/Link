@@ -195,7 +195,7 @@ class SignalingClient(
                 } catch (e: Exception) {
                     Log.e(tag, "Offer poller error: ${e.message}")
                 }
-                delay(3000) // Poll every 3 seconds
+                delay(1000) // Poll every 1 second
             }
         }
     }
@@ -288,10 +288,12 @@ class SignalingClient(
             while (isActive) {
                 publishAddress()
                 
-                // First 60 seconds: publish every 5 seconds for fast discovery
-                // After that: every 2 minutes
+                // Aggressive start: every 5 seconds for the first minute
+                // Then back off to every 2 minutes
                 if (iterations < 12) {
                     delay(5000)
+                } else if (iterations < 24) {
+                    delay(30000)
                 } else {
                     delay(2 * 60 * 1000)
                 }
