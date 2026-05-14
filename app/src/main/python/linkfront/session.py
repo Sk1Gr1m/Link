@@ -25,12 +25,19 @@ class Session:
         if not isinstance(data, (bytes, bytearray)):
             data = bytes(x & 0xff for x in data)
         
-        decrypted = self.box.decrypt(data).decode()
-        counter_str, msg = decrypted.split(":", 1)
-        counter = int(counter_str)
+        try:
+            decrypted = self.box.decrypt(data).decode()
+            if ":" not in decrypted:
+                raise ValueError("Malformed protocol message: missing counter")
+            
+            counter_str, msg = decrypted.split(":", 1)
+            counter = int(counter_str)
 
-        if counter <= self.last_seen:
-            raise Exception(f"Replay detected: counter {counter} <= last_seen {self.last_seen}")
+            if counter <= self.last_seen:
+                raise Exception(f"Replay detected: counter {counter} <= last_seen {self.last_seen}")
 
-        self.last_seen = counter
-        return msg
+            self.last_seen = counter
+            return msg
+        except Exception as e:
+            # Re-raise with context
+            raise Exception(f"Session decryption failed: {str(e)}")

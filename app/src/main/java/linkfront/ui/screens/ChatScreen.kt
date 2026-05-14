@@ -1,6 +1,7 @@
 package com.linkfront.ui.screens
 
 import android.graphics.BitmapFactory
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -147,8 +148,11 @@ fun ChatScreen(
 
     // Monitor DHT status globally in chat
     var dhtConnected by remember { mutableStateOf(false) }
-    LaunchedEffect(webrtcManager) {
-        if (webrtcManager == null) return@LaunchedEffect
+    LaunchedEffect(webrtcManager, dhtConnected) {
+        if (webrtcManager == null) {
+            dhtConnected = false
+            return@LaunchedEffect
+        }
         while (true) {
             val statusJson = webrtcManager.getDhtStatus()
             if (statusJson != null) {
@@ -161,19 +165,20 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(webrtcManager?.connectionStatus, webrtcManager?.peerFingerprint, fingerprint, dhtConnected) {
-        if (fingerprint == "SELF") return@LaunchedEffect
+    LaunchedEffect(webrtcManager, webrtcManager?.connectionStatus, webrtcManager?.peerFingerprint, fingerprint, dhtConnected) {
+        if (fingerprint == "SELF" || webrtcManager == null) return@LaunchedEffect
         
         // 1. Connection Logic
         // Immediate attempt if disconnected
-        if (webrtcManager != null && (webrtcManager.peerFingerprint != fingerprint || webrtcManager.connectionStatus == "Disconnected")) {
+        if (webrtcManager.peerFingerprint != fingerprint || webrtcManager.connectionStatus == "Disconnected") {
             if (dhtConnected) {
+                Log.d("ChatScreen", "Triggering connection to $fingerprint (DHT Connected)")
                 webrtcManager.connectToPeerViaDHT(fingerprint)
             }
         }
 
         // 2. Auto-Resend Logic
-        if (webrtcManager != null && webrtcManager.peerFingerprint == fingerprint && webrtcManager.connectionStatus == "Connected") {
+        if (webrtcManager.peerFingerprint == fingerprint && webrtcManager.connectionStatus == "Connected") {
             val failedMessages = messageDao.getFailedMessagesForPeer(fingerprint)
             if (failedMessages.isNotEmpty()) {
                 failedMessages.forEach { msg ->
@@ -193,15 +198,15 @@ fun ChatScreen(
 
         // 3. Polling loop
         while (true) {
-            val currentStatus = webrtcManager?.connectionStatus
-            val currentPeer = webrtcManager?.peerFingerprint
+            val currentStatus = webrtcManager.connectionStatus
+            val currentPeer = webrtcManager.peerFingerprint
             
             if (currentPeer != fingerprint || currentStatus == "Disconnected") {
                 if (dhtConnected) {
-                    webrtcManager?.connectToPeerViaDHT(fingerprint)
+                    webrtcManager.connectToPeerViaDHT(fingerprint)
                 }
             }
-            delay(30000)
+            delay(20000) // Slightly more aggressive polling
         }
     }
 

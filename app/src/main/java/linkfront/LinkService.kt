@@ -70,6 +70,11 @@ class LinkService : Service() {
             return START_NOT_STICKY
         }
         
+        // Ensure manager is initialized if we are starting up
+        if (webrtcManager == null) {
+            initManager()
+        }
+        
         // Use a notification immediately on start for Android 12 compliance
         val notification = notificationHelper.getServiceNotification()
         try {
@@ -87,11 +92,8 @@ class LinkService : Service() {
 
     private fun registerNetworkCallback() {
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
 
-        connectivityManager.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+        connectivityManager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 val caps = connectivityManager.getNetworkCapabilities(network)
                 val type = when {
@@ -101,12 +103,10 @@ class LinkService : Service() {
                     else -> "Other"
                 }
                 
-                Log.d(tag, "Network available ($type), triggering DHT refresh")
+                Log.d(tag, "Default Network available ($type), triggering recovery")
                 
-                // When network changes, our IP likely changed. Refresh immediately.
-                scope.launch {
-                    webrtcManager?.publishMyAddress()
-                }
+                // When network changes, our IP changed and DHT might need a boost
+                webrtcManager?.handleNetworkChange()
                 
                 // Re-acquire lock if needed when network changes
                 acquireMulticastLock()
@@ -114,7 +114,11 @@ class LinkService : Service() {
 
             override fun onLost(network: Network) {
                 Log.w(tag, "Network connection lost!")
-                webrtcManager?.onStateChanged?.invoke("Offline")
+                // Only mark offline if we truly have no internet anymore
+                val activeNetwork = connectivityManager.activeNetwork
+                if (activeNetwork == null) {
+                    webrtcManager?.onStateChanged?.invoke("Offline")
+                }
             }
         })
     }
@@ -147,6 +151,8 @@ class LinkService : Service() {
     }
 
     private fun initManager() {
+        if (webrtcManager != null) return
+
         val database = AppDatabase.getDatabase(this)
         val identityManager = LinkIdentityManager(this)
         val myFingerprint = identityManager.fingerprint
@@ -177,8 +183,21 @@ class LinkService : Service() {
             val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
             dhtNode.callAttr("initialize_dht", myFingerprint, dhtCachePath)
             
+            // PROACTIVE BOOTSTRAP: Feed trusted peers from DB into DHT
+            try {
+                val peers = database.peerDao().getAllPeersOnce()
+                peers.forEach { peer ->
+                    if (peer.lastKnownIp != null && peer.lastKnownPort != 0) {
+                        Log.d(tag, "Adding trusted peer ${peer.username} to DHT bootstrap: ${peer.lastKnownIp}")
+                        // Signaling port is often a good hint for DHT port if they are neighboring
+                        dhtNode.callAttr("add_dht_bootstrap", peer.lastKnownIp, peer.lastKnownPort + 1)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to feed trusted peers to DHT: ${e.message}")
+            }
+            
             // Revert to aggressive immediate publish (like in commit 78a4650e)
-            // The SignalingClient heartbeat will ensure it keeps trying
             webrtcManager?.publishMyAddress()
         }
     }

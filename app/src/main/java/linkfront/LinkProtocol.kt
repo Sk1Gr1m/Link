@@ -183,7 +183,8 @@ class LinkProtocol(
         }
 
         // 2. Handle encrypted protocol messages
-        val s = session ?: return
+        val s = session
+        if (s == null || s.toString() == "None") return
         try {
             val decrypted = s.callAttr("decrypt", data).toString()
             val json = JSONObject(decrypted)

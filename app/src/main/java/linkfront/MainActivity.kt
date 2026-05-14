@@ -80,6 +80,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        // Ensure service is started as well as bound
+        initWebRTC()
         Intent(this, LinkService::class.java).also { intent ->
             bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         }

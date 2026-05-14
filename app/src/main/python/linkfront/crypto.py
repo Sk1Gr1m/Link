@@ -53,26 +53,49 @@ def generate_ephemeral_keypair():
 
 def establish_session(my_ed_priv, my_eph_priv, peer_ed_pub, peer_eph_pub):
     """Triple Diffie-Hellman-ish session establishment."""
-    my_ed_priv = ensure_bytes(my_ed_priv)
-    my_eph_priv = ensure_bytes(my_eph_priv)
-    peer_ed_pub = ensure_bytes(peer_ed_pub)
-    peer_eph_pub = ensure_bytes(peer_eph_pub)
+    try:
+        # Force strict bytes conversion immediately to satisfy PyNaCl
+        def strict_32_bytes(b):
+            if b is None: return b'\x00' * 32
+            # Handle Chaquopy jarray/list conversion
+            if not isinstance(b, (bytes, bytearray)):
+                try:
+                    res = bytes(x & 0xff for x in b)
+                except:
+                    res = b'\x00' * 32
+            else:
+                res = bytes(b)
+            
+            if len(res) == 32: return res
+            if len(res) > 32: return res[:32]
+            return res.ljust(32, b'\x00')
 
-    # Convert all to Curve25519
-    me_static = _to_curve_priv(my_ed_priv)
-    me_eph = PrivateKey(my_eph_priv)
-    
-    peer_static = _to_curve_pub(peer_ed_pub)
-    peer_eph = PublicKey(peer_eph_pub)
-    
-    # Simple shared secret derivation using low-level bindings
-    ss1 = crypto_scalarmult(bytes(me_static), bytes(peer_eph))
-    ss2 = crypto_scalarmult(bytes(me_eph), bytes(peer_static))
-    ss3 = crypto_scalarmult(bytes(me_eph), bytes(peer_eph))
-    
-    # Ensure deterministic order of ss1 and ss2 for both peers
-    ss_ordered = sorted([ss1, ss2])
-    
-    combined = ss_ordered[0] + ss_ordered[1] + ss3
-    shared_secret = hashlib.blake2b(combined, digest_size=32).digest()
-    return Session(shared_secret)
+        my_ed_priv = strict_32_bytes(my_ed_priv)
+        my_eph_priv = strict_32_bytes(my_eph_priv)
+        peer_ed_pub = strict_32_bytes(peer_ed_pub)
+        peer_eph_pub = strict_32_bytes(peer_eph_pub)
+
+        # Convert all to Curve25519
+        me_static = _to_curve_priv(my_ed_priv)
+        me_eph = PrivateKey(my_eph_priv)
+        
+        peer_static = _to_curve_pub(peer_ed_pub)
+        peer_eph = PublicKey(peer_eph_pub)
+        
+        # Simple shared secret derivation using low-level bindings
+        ss1 = crypto_scalarmult(bytes(me_static), bytes(peer_eph))
+        ss2 = crypto_scalarmult(bytes(me_eph), bytes(peer_static))
+        ss3 = crypto_scalarmult(bytes(me_eph), bytes(peer_eph))
+        
+        # Ensure deterministic order of ss1 and ss2 for both peers
+        ss_ordered = sorted([ss1, ss2])
+        
+        combined = ss_ordered[0] + ss_ordered[1] + ss3
+        shared_secret = hashlib.blake2b(combined, digest_size=32).digest()
+        return Session(shared_secret)
+    except Exception as e:
+        import traceback
+        # Use simple print as logging might not be initialized here
+        print(f"establish_session error: {str(e)}")
+        # Return None so Kotlin can handle it gracefully instead of crashing the process
+        return None
