@@ -39,6 +39,7 @@ fun ProfileScreen(
     var tempUsername by remember { mutableStateOf(webrtcManager?.myUsername ?: "") }
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var qrLabel by remember { mutableStateOf<String?>(null) }
+    var isGeneratingQr by remember { mutableStateOf(false) }
     var dhtStatus by remember { mutableStateOf("Checking DHT...") }
     val scrollState = rememberScrollState()
 
@@ -69,6 +70,7 @@ fun ProfileScreen(
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
+            isGeneratingQr = true
             webrtcManager?.processScannedQr(result.contents) { answerQr ->
                 // If the scanned QR was an Offer, this callback provides the Answer QR
                 val encoder = BarcodeEncoder()
@@ -77,7 +79,15 @@ fun ProfileScreen(
                     qrLabel = "Answer QR (Let Peer A scan this)"
                 } catch (e: Exception) {
                     Log.e("ProfileScreen", "Failed to encode Answer QR: ${e.message}")
+                } finally {
+                    isGeneratingQr = false
                 }
+            }
+            // If it was an answer, processScannedQr won't call onAnswerReady
+            // We should probably have a way to know it finished.
+            // For now, let's assume if no answer is ready within some time or if we know it's an answer.
+            if (!result.contents.contains("\"type\":\"offer\"")) {
+                isGeneratingQr = false
             }
         }
     }
@@ -187,7 +197,7 @@ fun ProfileScreen(
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
 
-            if (qrBitmap != null) {
+            if (qrBitmap != null && !isGeneratingQr) {
                 Text(qrLabel ?: "Connection QR", style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(8.dp))
                 Image(
@@ -202,7 +212,15 @@ fun ProfileScreen(
                         .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("No QR Generated", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (isGeneratingQr) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(modifier = Modifier.size(48.dp))
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text("Gathering ICE candidates...", style = MaterialTheme.typography.bodySmall)
+                        }
+                    } else {
+                        Text("No QR Generated", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
             
@@ -210,6 +228,8 @@ fun ProfileScreen(
 
             Button(
                 onClick = {
+                    qrBitmap = null
+                    isGeneratingQr = true
                     webrtcManager?.getConnectionQrData { qrData ->
                         val encoder = BarcodeEncoder()
                         try {
@@ -217,9 +237,12 @@ fun ProfileScreen(
                             qrLabel = "Offer QR (Peer scans this)"
                         } catch (e: Exception) {
                             Log.e("ProfileScreen", "Failed to encode Offer QR: ${e.message}")
+                        } finally {
+                            isGeneratingQr = false
                         }
                     }
                 },
+                enabled = !isGeneratingQr,
                 modifier = Modifier.fillMaxWidth()
             ) { Text("1. Generate Offer QR") }
 
