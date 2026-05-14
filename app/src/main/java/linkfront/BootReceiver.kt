@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Build
 
 class BootReceiver : BroadcastReceiver() {
+    // Starts the background service when the device finishes booting
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
             val serviceIntent = Intent(context, LinkService::class.java)

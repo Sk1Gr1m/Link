@@ -5,6 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
+// Room database for storing messages and peer information
 @Database(
     entities = [MessageEntity::class, PeerEntity::class],
     version = 16,

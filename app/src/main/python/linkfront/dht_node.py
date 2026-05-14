@@ -22,7 +22,7 @@ logging.getLogger("kademlia.routing").setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DHTNode")
 
-# Persistent event loop in a background thread
+# Persistent event loop for asynchronous operations
 _loop = None
 _loop_thread = None
 
@@ -52,6 +52,7 @@ def run_async(coro, timeout=30):
 
 _ip_cache = {"public": None, "public_port": None, "local": None, "last_check": 0}
 
+# Discover the device's public IP using STUN protocol
 def get_public_ip_stun(server_index=0):
     """Discover public IP and Port using STUN (RFC 5389)"""
     stun_servers = [
@@ -132,6 +133,7 @@ def get_local_ip():
         return ip
     except: return "127.0.0.1"
 
+# Kademlia DHT node implementation
 class DHTNode:
     _instance = None
     _lock = threading.Lock()
@@ -156,6 +158,7 @@ class DHTNode:
         if not self.started:
             asyncio.run_coroutine_threadsafe(self._start_internal(), _get_or_create_loop())
 
+    # Startup internal background tasks for DHT
     async def _start_internal(self):
         if self.started: return
         try:
@@ -213,6 +216,7 @@ class DHTNode:
                     await asyncio.sleep(300)
             except: await asyncio.sleep(30)
 
+    # Connect to the DHT network via bootstrap nodes
     async def _bootstrap(self, force=False):
         async with self.bootstrap_lock:
             now = time.time()
@@ -270,6 +274,7 @@ class DHTNode:
         try: await self.server.bootstrap(speculative)
         except: pass
 
+    # Periodically broadcast presence on the local network
     async def _broadcast_loop(self):
         while True:
             if self.started and self.server and self.server.protocol:
@@ -309,6 +314,7 @@ class DHTNode:
                 if self.server:
                     asyncio.create_task(self.server.bootstrap([(ip, int(port))]))
 
+    # Publish information to the DHT
     async def publish(self, key, value):
         if not self.started: return False
         try:
@@ -334,6 +340,7 @@ class DHTNode:
             "public_port": _ip_cache.get("public_port")
         }
 
+    # Store a signaling message (Offer, Answer, or Candidate) in the DHT
     async def put_signal(self, target, sender, sig_type, content):
         if sig_type == "CANDIDATE":
             key = f"sig:{target}:{sender}:cands"

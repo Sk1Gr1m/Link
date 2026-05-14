@@ -8,6 +8,7 @@ from nacl.bindings import crypto_scalarmult
 from .session import Session
 import hashlib
 
+# Ensure input is a bytes object, handling Chaquopy's Java-to-Python conversion
 def ensure_bytes(b):
     if b is None:
         return None
@@ -16,16 +17,19 @@ def ensure_bytes(b):
     # Handle Chaquopy's jarray or list of signed integers from Java
     return bytes(x & 0xff for x in b)
 
+# Convert Ed25519 public key to Curve25519 for encryption
 def _to_curve_pub(ed_pub_bytes):
     ed_pub_bytes = ensure_bytes(ed_pub_bytes)
     vk = VerifyKey(ed_pub_bytes)
     return vk.to_curve25519_public_key()
 
+# Convert Ed25519 private key to Curve25519 for decryption
 def _to_curve_priv(ed_priv_bytes):
     ed_priv_bytes = ensure_bytes(ed_priv_bytes)
     sk = SigningKey(ed_priv_bytes)
     return sk.to_curve25519_private_key()
 
+# Encrypt a message for a peer using their public key
 def encrypt_for_peer(message_str, peer_ed_public_key_bytes):
     """Converts Ed25519 to Curve25519 and encrypts via SealedBox."""
     peer_ed_public_key_bytes = ensure_bytes(peer_ed_public_key_bytes)
@@ -47,10 +51,12 @@ def decrypt_with_my_key(ciphertext_bytes, my_ed_private_key_bytes):
     curve_priv = _to_curve_priv(my_ed_private_key_bytes)
     return SealedBox(curve_priv).decrypt(ciphertext_bytes).decode()
 
+# Generate a one-time keypair for session negotiation
 def generate_ephemeral_keypair():
     sk = PrivateKey.generate()
     return [bytes(sk), bytes(sk.public_key)]
 
+# Establish a secure shared secret using Diffie-Hellman exchange
 def establish_session(my_ed_priv, my_eph_priv, peer_ed_pub, peer_eph_pub):
     """Triple Diffie-Hellman-ish session establishment."""
     try:

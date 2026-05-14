@@ -43,6 +43,7 @@ fun ProfileScreen(
     var dhtStatus by remember { mutableStateOf("Checking DHT...") }
     val scrollState = rememberScrollState()
 
+    // Periodically update DHT connection status
     LaunchedEffect(webrtcManager) {
         if (webrtcManager == null) return@LaunchedEffect
         while (true) {
@@ -68,11 +69,12 @@ fun ProfileScreen(
         }
     }
 
+    // Handles QR code scanning results
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             isGeneratingQr = true
             webrtcManager?.processScannedQr(result.contents) { answerQr ->
-                // If the scanned QR was an Offer, this callback provides the Answer QR
+                // If we scanned an Offer, generate the Answer QR for the peer to scan back
                 val encoder = BarcodeEncoder()
                 try {
                     qrBitmap = encoder.encodeBitmap(answerQr, BarcodeFormat.QR_CODE, 512, 512)
@@ -83,15 +85,14 @@ fun ProfileScreen(
                     isGeneratingQr = false
                 }
             }
-            // If it was an answer, processScannedQr won't call onAnswerReady
-            // We should probably have a way to know it finished.
-            // For now, let's assume if no answer is ready within some time or if we know it's an answer.
+            // Stop loading if it was an Answer (no response QR needed)
             if (!result.contents.contains("\"type\":\"offer\"")) {
                 isGeneratingQr = false
             }
         }
     }
 
+    // Show incoming connection request dialog
     if (pendingRequest != null) {
         AlertDialog(
             onDismissRequest = { },
@@ -141,12 +142,10 @@ fun ProfileScreen(
             
             Spacer(modifier = Modifier.height(16.dp))
 
+            // Username input field
             OutlinedTextField(
                 value = tempUsername,
-                onValueChange = { 
-                    // Allow typing, but we will sanitize on save
-                    tempUsername = it 
-                },
+                onValueChange = { tempUsername = it },
                 label = { Text("Your Username") },
                 placeholder = { Text("Enter a safe username") },
                 supportingText = {
@@ -159,7 +158,6 @@ fun ProfileScreen(
                         TextButton(onClick = { 
                             val success = webrtcManager?.updateUsername(tempUsername) ?: false
                             if (!success) {
-                                // Reset to current valid username if update failed
                                 tempUsername = webrtcManager?.myUsername ?: ""
                             }
                         }) {
@@ -179,6 +177,7 @@ fun ProfileScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Status indicators
             Text(
                 text = dhtStatus,
                 style = MaterialTheme.typography.bodySmall,
@@ -197,6 +196,7 @@ fun ProfileScreen(
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
 
+            // QR Code display area
             if (qrBitmap != null && !isGeneratingQr) {
                 Text(qrLabel ?: "Connection QR", style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(8.dp))
@@ -226,6 +226,7 @@ fun ProfileScreen(
             
             Spacer(modifier = Modifier.height(24.dp))
 
+            // Step 1: Generate an Offer QR for a peer to scan
             Button(
                 onClick = {
                     qrBitmap = null
@@ -246,6 +247,7 @@ fun ProfileScreen(
                 modifier = Modifier.fillMaxWidth()
             ) { Text("1. Generate Offer QR") }
 
+            // Step 2: Scan a peer's QR code
             OutlinedButton(
                 onClick = {
                     val options = ScanOptions()
@@ -258,6 +260,7 @@ fun ProfileScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
+            // Reset current WebRTC session
             TextButton(
                 onClick = {
                     webrtcManager?.renewConnection()

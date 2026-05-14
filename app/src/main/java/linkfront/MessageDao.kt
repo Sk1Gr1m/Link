@@ -5,6 +5,7 @@ import androidx.room.Insert
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
 
+// Data access object for chat messages in the Room database
 @Dao
 interface MessageDao {
     @Query("SELECT * FROM messages WHERE peerFingerprint = :fingerprint ORDER BY timestamp ASC")

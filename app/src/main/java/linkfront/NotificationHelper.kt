@@ -12,6 +12,7 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 
+// Manages system notifications for background status and chat messages
 class NotificationHelper(private val context: Context) {
 
     companion object {
@@ -26,6 +27,7 @@ class NotificationHelper(private val context: Context) {
         createChannels()
     }
 
+    // Create notification channels required for Android 8.0+
     private fun createChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val serviceChannel = NotificationChannel(
@@ -51,6 +53,7 @@ class NotificationHelper(private val context: Context) {
         }
     }
 
+    // Create the persistent notification for the background service
     fun getServiceNotification(): Notification {
         val appIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -82,6 +85,7 @@ class NotificationHelper(private val context: Context) {
             .build()
     }
 
+    // Show a heads-up notification for an incoming message
     fun showChatNotification(sender: String, message: String) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {

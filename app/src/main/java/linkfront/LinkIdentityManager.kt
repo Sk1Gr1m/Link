@@ -8,6 +8,7 @@ import androidx.core.content.edit
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 
+// Manages the user's cryptographic identity and username
 class LinkIdentityManager(private val context: Context) {
     private val py = Python.getInstance()
     private val linkModule = py.getModule("linkfront")
@@ -40,6 +41,7 @@ class LinkIdentityManager(private val context: Context) {
         fingerprint = calculateFingerprint()
     }
 
+    // Change the display name and save it to preferences
     fun updateUsername(newName: String): Boolean {
         val sanitized = sanitizeUsername(newName)
         if (sanitized.isEmpty()) return false
@@ -51,14 +53,15 @@ class LinkIdentityManager(private val context: Context) {
         return true
     }
 
+    // Clean up a username string to prevent illegal characters or spoofing
     fun sanitizeUsername(name: String): String {
-        // 1. Remove control characters and leading/trailing whitespace
+        // Remove control characters and whitespace
         var sanitized = name.trim().filter { it.code >= 32 }
         
-        // 2. Limit length (e.g., 32 characters)
+        // Limit length
         if (sanitized.length > 32) sanitized = sanitized.take(32)
         
-        // 3. Prevent names that look like fingerprints (HEX:HEX:HEX:HEX)
+        // Prevent names that look like fingerprints
         val fingerprintRegex = Regex("^([0-9A-F]{4}:){3}[0-9A-F]{4}.*", RegexOption.IGNORE_CASE)
         if (fingerprintRegex.matches(sanitized)) {
             return "User_" + sanitized.take(4)
@@ -67,6 +70,7 @@ class LinkIdentityManager(private val context: Context) {
         return sanitized
     }
 
+    // Generate the human-readable fingerprint for a public key
     private fun calculateFingerprint(key: ByteArray? = null): String {
         return if (key == null) {
             identity?.callAttr("get_fingerprint")?.toString() ?: "UNKNOWN"

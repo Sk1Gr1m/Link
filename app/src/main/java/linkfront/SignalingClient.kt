@@ -10,6 +10,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import org.webrtc.IceCandidate
 
+// Handles direct TCP signaling and DHT message exchange
 class SignalingClient(
     private val identityManager: LinkIdentityManager,
     private val onOfferReceived: (String, String, (String) -> Unit) -> Unit,
@@ -17,6 +18,7 @@ class SignalingClient(
     private val onIceCandidateReceived: (IceCandidate) -> Unit
 ) {
     companion object {
+        // Ports used for direct TCP signaling
         val PREFERRED_PORTS = listOf(8467, 8469, 8470, 8471, 8472, 8473, 8475)
     }
 
@@ -29,17 +31,20 @@ class SignalingClient(
     var localPort: Int = 0
         private set
 
+    // Start all signaling background tasks
     fun start() {
         startListener()
         startOfferPoller()
         startHeartbeat()
     }
 
+    // Stop all tasks and close the server
     fun stop() {
         scope.cancel()
         serverSocket?.close()
     }
 
+    // Listens for incoming direct signaling connections
     private fun startListener() {
         scope.launch {
             for (port in PREFERRED_PORTS) {
@@ -72,6 +77,7 @@ class SignalingClient(
         }
     }
 
+    // Handles an individual signaling connection
     private fun handleClient(socket: Socket) {
         scope.launch {
             try {
@@ -118,6 +124,7 @@ class SignalingClient(
         }
     }
 
+    // Polls DHT for incoming WebRTC offers
     private fun startOfferPoller() {
         scope.launch {
             while (isActive) {
@@ -151,6 +158,7 @@ class SignalingClient(
         }
     }
 
+    // Polls DHT for incoming ICE candidates
     fun startCandidatePoller(peerFingerprint: String) {
         scope.launch {
             val seen = mutableSetOf<String>()
@@ -184,6 +192,7 @@ class SignalingClient(
         }
     }
 
+    // Encrypt and send a WebRTC offer through the DHT
     fun sendOfferViaDHT(targetFingerprint: String, sdp: String, targetPublicKey: ByteArray, offerId: String) {
         scope.launch {
             try {
@@ -201,6 +210,7 @@ class SignalingClient(
         }
     }
 
+    // Send an ICE candidate to a peer via DHT
     fun sendCandidateViaDHT(targetFingerprint: String, candidate: IceCandidate, alternateChannel: String? = null) {
         scope.launch {
             val cJson = JSONObject().apply {
@@ -233,11 +243,12 @@ class SignalingClient(
                 } catch (e: Exception) {
                     Log.e(tag, "Heartbeat error: ${e.message}")
                 }
-                delay(300000) // 5 minutes
+                delay(300000)
             }
         }
     }
 
+    // Check current connection status of the DHT node
     fun getDhtStatus(): String? {
         return try {
             linkModule.callAttr("get_dht_status").toString()
@@ -246,6 +257,7 @@ class SignalingClient(
         }
     }
 
+    // Publishes local address info to the DHT
     fun publishAddress() {
         scope.launch {
             try {
@@ -265,6 +277,7 @@ class SignalingClient(
         }
     }
 
+    // Find a peer's IP addresses stored in the DHT
     fun lookupAddress(fingerprint: String): List<Pair<String, Int>> {
         val result = mutableListOf<Pair<String, Int>>()
         try {
@@ -288,6 +301,7 @@ class SignalingClient(
         return result
     }
 
+    // Attempt to send an offer directly via TCP socket
     fun sendOfferDirectly(ip: String, port: Int, sdp: String, offerId: String): String? {
         return try {
             val socket = Socket()
@@ -317,22 +331,23 @@ class SignalingClient(
         }
     }
 
+    // Sends a WebRTC answer via DHT and direct TCP
     fun sendAnswer(targetFingerprint: String, answerSdp: String, peerPublicKey: ByteArray?, directIps: List<String> = emptyList(), directPort: Int = 0, offerId: String = "legacy") {
         scope.launch {
-            // 1. DHT Signaling - Send to both fingerprint and offerId fallback
+            // 1. DHT signaling
             try {
                 Log.d(tag, "Sending Answer to $targetFingerprint via DHT")
                 linkModule.callAttr("send_signal", targetFingerprint, identityManager.fingerprint, "ANSWER", answerSdp)
                 
                 if (offerId != "legacy") {
-                    // Fallback channel for peers who don't know our fingerprint yet
+                    // Fallback channel
                     linkModule.callAttr("send_signal", targetFingerprint, offerId, "ANSWER", answerSdp)
                 }
             } catch (e: Exception) {
                 Log.e(tag, "Failed to send answer via DHT: ${e.message}")
             }
 
-            // 2. Direct Socket to all known addresses (RACING ATTEMPT)
+            // 2. Direct TCP racing
             val addresses = lookupAddress(targetFingerprint).toMutableList()
             for (ip in directIps) {
                 if (ip.isNotEmpty() && directPort != 0) {
@@ -362,6 +377,7 @@ class SignalingClient(
         }
     }
 
+    // Watches DHT for an answer on a specific channel
     fun watchPostBox(channel: String, callback: (String) -> Unit) {
         scope.launch {
             for (i in 1..60) {

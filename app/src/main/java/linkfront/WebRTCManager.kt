@@ -18,6 +18,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
+// Manages WebRTC connections, data channels, and peer handshake
 class WebRTCManager(
     private val context: Context,
     private val messageDao: MessageDao,
@@ -48,7 +49,7 @@ class WebRTCManager(
     
     private val pcLock = Mutex()
     private var isNegotiating = false
-    
+
     private val queuedRemoteCandidates = mutableListOf<IceCandidate>()
 
     val myUsername get() = identityManager.username
@@ -92,7 +93,7 @@ class WebRTCManager(
 
         signalingClient.start()
         
-        // STUN / NAT Detection Logic
+        // Detect NAT type and monitor DHT status
         scope.launch {
             try {
                 delay(2000) // Give DHT time to start
@@ -110,7 +111,7 @@ class WebRTCManager(
                 val stunInfoJson = dhtNode.callAttr("get_stun_info").toString()
                 val stunInfo = JSONObject(stunInfoJson)
                 Log.i(tag, "NAT Type: ${stunInfo.optString("nat_type", "Unknown")}")
-                
+
                 if (stunInfo.optBoolean("is_symmetric", false)) {
                     isSymmetricNat = true
                     Log.w(tag, "Symmetric NAT detected! Port prediction might be needed.")
@@ -132,8 +133,8 @@ class WebRTCManager(
         scope.launch {
             peerDao.getAllPeers().collect { peers ->
                 trustedPeers.clear()
-                peers.forEach { 
-                    trustedPeers[it.fingerprint] = PeerIdentity(it.identityKey, 0L) 
+                peers.forEach {
+                    trustedPeers[it.fingerprint] = PeerIdentity(it.identityKey, 0L)
                 }
             }
         }
@@ -141,25 +142,26 @@ class WebRTCManager(
         startPendingRetryLoop()
     }
 
+    // Periodically check for peers with pending messages and try to connect
     private fun startPendingRetryLoop() {
         scope.launch {
             // Give DHT and signaling a moment to stabilize
             delay(8000)
             
-            // ONE-TIME: Proactive sweep of recent peers on startup
+            // One-time check for recent peers on startup
             if (isOnline() && connectionStatus == "Disconnected") {
                 val peers = peerDao.getAllPeersOnce()
                 val prioritizedPeers = peers.filter { it.fingerprint != "SELF" }
                     .sortedByDescending { it.lastSeen }
-                    .take(3) // Try top 3 most recent
+                    .take(3)
                 
                 if (prioritizedPeers.isNotEmpty()) {
                     Log.d(tag, "Startup proactive reconnect for ${prioritizedPeers.size} peers")
                     prioritizedPeers.forEach { peer ->
                         if (connectionStatus == "Disconnected" || peerFingerprint != peer.fingerprint) {
                             connectToPeerViaDHT(peer.fingerprint)
-                            // Stagger attempts to allow one to complete or timeout
-                            delay(15000) 
+                            // Stagger attempts
+                            delay(15000)
                         }
                     }
                 }
@@ -203,6 +205,7 @@ class WebRTCManager(
 
     private var lastRenewTime = 0L
 
+    // Restart the connection state, optionally keeping the peer target
     fun renewConnection(reconnectIfPossible: Boolean = false) {
         val now = System.currentTimeMillis()
         if (now - lastRenewTime < 5000) {
@@ -213,7 +216,7 @@ class WebRTCManager(
 
         mainHandler.post {
             if (isDestroyed) return@post
-            
+
             // Do not reset if we are currently trying to connect via QR
             if (isQrHandshakeActive) {
                 Log.d(tag, "Renew connection ignored: QR Handshake in progress or active peer.")
@@ -257,27 +260,28 @@ class WebRTCManager(
             if (isDestroyed) return@post
             Log.i(tag, "Network change detected. Refreshing signaling and DHT.")
             isSymmetricNat = false
-            
-            // This will force re-bootstrap and publish our new IP
-            signalingClient.publishAddress() 
+
+            // Force re-bootstrap and publish our new IP
+            signalingClient.publishAddress()
             
             val currentPeer = peerFingerprint
             if (currentPeer != null) {
                 Log.i(tag, "Proactively reconnecting to active peer: $currentPeer")
-                // Using a slight delay to allow the new network to stabilize
+                // Wait for the new network to stabilize
                 mainHandler.postDelayed({
                     if (isDestroyed) return@postDelayed
                     prepareForNewConnection()
-                    connectionStatus = "Disconnected" // Reset so connectToPeerViaDHT doesn't skip
+                    connectionStatus = "Disconnected"
                     connectToPeerViaDHT(currentPeer)
                 }, 2000)
             }
         }
     }
 
+    // Prepare internal state for a fresh connection attempt
     private fun prepareForNewConnection() {
         if (isDestroyed) return
-        
+
         scope.launch {
             pcLock.withLock {
                 internalPrepareForNewConnection()
@@ -327,6 +331,7 @@ class WebRTCManager(
         }
     }
 
+    // Clean up all resources when the manager is no longer needed
     fun destroy() {
         isDestroyed = true
         signalingClient.stop()
@@ -376,7 +381,7 @@ class WebRTCManager(
                 val hasRelay = sdp.contains("typ relay")
                 val hasSrflx = sdp.contains("typ srflx")
                 
-                // If symmetric NAT, we REALLY want that relay candidate.
+                // If symmetric NAT, we need a relay candidate.
                 val shouldWaitMore = if (isSymmetricNat) {
                     !hasRelay && gatheringAttempts < 25
                 } else {
@@ -398,9 +403,9 @@ class WebRTCManager(
                 val fullSdp = it.description
                 val thinned = thinSdp(fullSdp)
                 val candidateCount = fullSdp.split("\n").count { line -> line.contains("a=candidate:") }
-                
+
                 Log.i(tag, "Gathering finished. Relay: ${fullSdp.contains("typ relay")}, WAN: ${fullSdp.contains("typ srflx")}, Total Candidates: $candidateCount. SDP Length: ${thinned.length}")
-                
+
                 onIceGatheringComplete?.invoke(thinned)
                 onIceGatheringComplete = null
             } ?: run {
@@ -409,6 +414,7 @@ class WebRTCManager(
         }
     }
 
+    // STUN and TURN server configuration for NAT traversal
     private fun createRtcConfig(): PeerConnection.RTCConfiguration {
         val iceServers = mutableListOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -417,18 +423,18 @@ class WebRTCManager(
             PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
-            
+
             // XIRSYS DEDICATED TURN SERVERS
             PeerConnection.IceServer.builder("turn:fr-turn4.xirsys.com:80?transport=udp")
                 .setUsername("PhBCoAjuCAZlbDkQHH6rGk6skdaV5-woeOEPsqVnhtiPp1FsQZNNmCJQd9bbsij0AAAAAGoE_J5TazFHcmlt")
                 .setPassword("ffed8066-4f1b-11f1-8655-fe25fa5c4b8f")
                 .createIceServer(),
-                
+
             PeerConnection.IceServer.builder("turn:fr-turn4.xirsys.com:3478?transport=udp")
                 .setUsername("PhBCoAjuCAZlbDkQHH6rGk6skdaV5-woeOEPsqVnhtiPp1FsQZNNmCJQd9bbsij0AAAAAGoE_J5TazFHcmlt")
                 .setPassword("ffed8066-4f1b-11f1-8655-fe25fa5c4b8f")
                 .createIceServer(),
-                
+
             PeerConnection.IceServer.builder("turns:fr-turn4.xirsys.com:443?transport=tcp")
                 .setUsername("PhBCoAjuCAZlbDkQHH6rGk6skdaV5-woeOEPsqVnhtiPp1FsQZNNmCJQd9bbsij0AAAAAGoE_J5TazFHcmlt")
                 .setPassword("ffed8066-4f1b-11f1-8655-fe25fa5c4b8f")
@@ -466,7 +472,7 @@ class WebRTCManager(
             override fun onIceCandidate(candidate: IceCandidate) {
                 mainHandler.post {
                     Log.d(tag, "Local Candidate discovered: ${candidate.sdp}")
-                    
+
                     // Forward candidate via Trickle ICE
                     // We send to both the fingerprint (if known) and the offerId (handshake channel)
                     val target = peerFingerprint
@@ -475,18 +481,18 @@ class WebRTCManager(
                     if (target != null) {
                         signalingClient.sendCandidateViaDHT(target, candidate, channel)
                     } else if (channel != null) {
-                        // If we don't know the peer yet (we are the offerer), 
+                        // If we don't know the peer yet (we are the offerer),
                         // we must send to the offerId channel so the scanner can find us.
                         signalingClient.sendCandidateViaDHT(channel, candidate)
                     }
 
-                    // EXTRA BULLETPROOF: If we discover our public IP via STUN, update the DHT node!
+                    // Update the DHT node if we find our public IP
                     if (candidate.sdp.contains("typ srflx")) {
                         val parts = candidate.sdp.split(" ")
                         if (parts.size > 4) {
                             val ip = parts[4]
                             val port = parts[5].toIntOrNull() ?: 0
-                            
+
                             scope.launch {
                                 try {
                                     val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
@@ -524,10 +530,10 @@ class WebRTCManager(
                     onStateChanged?.invoke(connectionStatus)
                 }
             }
-            override fun onDataChannel(dc: DataChannel) { 
+            override fun onDataChannel(dc: DataChannel) {
                 mainHandler.post {
                     if (isDestroyed) return@post
-                    setupDataChannel(dc) 
+                    setupDataChannel(dc)
                 }
             }
             override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
@@ -554,13 +560,13 @@ class WebRTCManager(
                     }
                 }
             }
-            override fun onMessage(buffer: DataChannel.Buffer) { 
+            override fun onMessage(buffer: DataChannel.Buffer) {
                 if (isDestroyed) return
-                protocol.onReceive(buffer) 
+                protocol.onReceive(buffer)
             }
         })
 
-        // RACING FIX: If channel is already open, send handshake immediately
+        // If channel is already open, send handshake immediately
         if (dc.state() == DataChannel.State.OPEN) {
             mainHandler.post {
                 Log.d(tag, "Data Channel already OPEN in setupDataChannel")
@@ -574,7 +580,7 @@ class WebRTCManager(
     private fun addIceCandidate(candidate: IceCandidate) {
         mainHandler.post {
             if (isDestroyed) return@post
-            
+
             val pc = peerConnection
             if (pc != null && pc.remoteDescription != null) {
                 Log.d(tag, "Adding remote ICE candidate: ${candidate.sdp}")
@@ -600,7 +606,7 @@ class WebRTCManager(
         val parts = sdp.split(" ").toMutableList()
         if (parts.size > 5) {
             val originalPort = parts[5].toIntOrNull() ?: return
-            // Blast a wider range if we think we are dealing with a difficult NAT
+            // Blast a range of ports for symmetric NAT
             val offsets = if (isSymmetricNat) {
                 listOf(-1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6)
             } else {
@@ -619,12 +625,13 @@ class WebRTCManager(
         }
     }
 
+    // Start a new WebRTC offer for outbound connections
     fun createOffer(onSdpReady: (String) -> Unit) {
         scope.launch {
             pcLock.withLock {
                 withContext(Dispatchers.Main) {
                     if (isDestroyed) return@withContext
-                    
+
                     internalPrepareForNewConnection()
                     
                     // Re-create if internalPrepare nulled it
@@ -642,7 +649,7 @@ class WebRTCManager(
 
                     gatheringTimeoutReached = false
                     onIceGatheringComplete = onSdpReady
-                    mainHandler.postDelayed(gatheringTimeoutRunnable, 45000) // 45s for two-way QR scan
+                    mainHandler.postDelayed(gatheringTimeoutRunnable, 45000)
 
                     isNegotiating = true
                     peerConnection?.createOffer(object : SimpleSdpObserver() {
@@ -677,6 +684,7 @@ class WebRTCManager(
         }
     }
 
+    // Process an SDP offer or answer from a remote peer
     private fun handleRemoteSdp(sdp: String, type: SessionDescription.Type, offerId: String?, onAnswerReady: ((String) -> Unit)?) {
         scope.launch {
             pcLock.withLock {
@@ -690,7 +698,7 @@ class WebRTCManager(
                         currentOfferId = offerId
                     }
                     
-                    // AVOID DUPLICATES AND RACES
+                    // Avoid duplicates and races
                     if (type == SessionDescription.Type.ANSWER && currentState != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
                         Log.w(tag, "Ignoring duplicate or late ANSWER. State: $currentState")
                         return@withContext
@@ -698,7 +706,7 @@ class WebRTCManager(
                     
                     if (type == SessionDescription.Type.OFFER) {
                         if (currentState == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
-                            // GLARE RESOLUTION: Deterministic winner based on fingerprint
+                            // Glare resolution: Deterministic winner based on fingerprint
                             if (myFingerprint < (peerFingerprint ?: "")) {
                                 Log.d(tag, "Glare detected: My fingerprint is lower. I win. Ignoring remote offer.")
                                 return@withContext
@@ -726,11 +734,11 @@ class WebRTCManager(
                         override fun onSetSuccess() {
                             mainHandler.post {
                                 Log.d(tag, "SetRemoteDescription Success")
-                                
+
                                 // Process queued candidates
                                 if (queuedRemoteCandidates.isNotEmpty()) {
                                     Log.i(tag, "Applying ${queuedRemoteCandidates.size} queued ICE candidates")
-                                    queuedRemoteCandidates.forEach { 
+                                    queuedRemoteCandidates.forEach {
                                         peerConnection?.addIceCandidate(it)
                                     }
                                     queuedRemoteCandidates.clear()
@@ -739,7 +747,7 @@ class WebRTCManager(
                                 if (type == SessionDescription.Type.OFFER) {
                                     gatheringTimeoutReached = false
                                     onIceGatheringComplete = onAnswerReady
-                                    mainHandler.postDelayed(gatheringTimeoutRunnable, 25000) // 25s for mobile
+                                    mainHandler.postDelayed(gatheringTimeoutRunnable, 25000)
                                     
                                     isNegotiating = true
                                     peerConnection?.createAnswer(object : SimpleSdpObserver() {
@@ -808,21 +816,21 @@ class WebRTCManager(
             if (type == "offer") {
                 isQrHandshakeActive = true
                 handleRemoteSdp(sdp, SessionDescription.Type.OFFER, offerId) { answerSdp ->
-                    // 1. Try background signaling via DHT AND direct fast-path
+                    // 1. Try background signaling via DHT and direct fast-path
                     val directIps = mutableListOf<String>()
                     if (peerPublicIp.isNotEmpty()) directIps.add(peerPublicIp)
                     if (peerIp.isNotEmpty()) directIps.add(peerIp)
                     
                     signalingClient.sendAnswer(
-                        peerFingerprint!!, 
-                        answerSdp, 
-                        pubKey, 
+                        peerFingerprint!!,
+                        answerSdp,
+                        pubKey,
                         directIps = directIps,
                         directPort = peerSignalingPort,
                         offerId = offerId
                     )
                     
-                    // 2. Prepare Answer JSON for manual QR fallback with connectivity info
+                    // 2. Prepare Answer JSON for manual QR fallback
                     scope.launch {
                         val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
                         val statusJson = dhtNode.callAttr("get_dht_status").toString()
@@ -847,7 +855,7 @@ class WebRTCManager(
             } else if (type == "answer") {
                 // Peer A scans Peer B's answer
                 isQrHandshakeActive = true
-                
+
                 // Trigger immediate refresh since we just added them as bootstrap
                 if (peerDhtPort != 0) {
                     scope.launch {
@@ -872,8 +880,8 @@ class WebRTCManager(
             scope.launch {
                 val py = Python.getInstance()
                 val dhtNode = py.getModule("linkfront.dht_node")
-                
-                // EXTRACT PUBLIC IP FROM SDP IF DHT IS SLOW
+
+                // Extract public IP from SDP if DHT is slow
                 val sdpIp = sdp.lines()
                     .find { it.contains("typ srflx") }
                     ?.split(" ")?.getOrNull(4)
@@ -889,7 +897,7 @@ class WebRTCManager(
 
                 val statusJson = dhtNode.callAttr("get_dht_status").toString()
                 Log.d(tag, "DHT Status for QR: $statusJson")
-                
+
                 val status = JSONObject(statusJson)
                 val localIp = status.optString("local_ip", "")
                 val publicIp = status.optString("public_ip", "")
@@ -967,13 +975,14 @@ class WebRTCManager(
 
     fun getDhtStatus() = signalingClient.getDhtStatus()
 
+    // Connect to a peer using their fingerprint via DHT lookup
     fun connectToPeerViaDHT(fingerprint: String) {
         if (!isOnline()) {
             Log.e(tag, "Aborting DHT connection: Device is offline")
             onStateChanged?.invoke("Offline")
             return
         }
-        
+
         // Avoid redundant connection attempts
         if (peerFingerprint == fingerprint && (connectionStatus == "Connected" || connectionStatus == "Connecting...")) {
             Log.d(tag, "Already connecting/connected to $fingerprint. Skipping.")
@@ -982,7 +991,7 @@ class WebRTCManager(
 
         scope.launch {
             val peer = peerDao.getPeerByFingerprint(fingerprint) ?: return@launch
-            
+
             // Set intent early to guide UI and avoid races
             if (peerFingerprint != fingerprint) {
                 peerFingerprint = fingerprint
@@ -995,10 +1004,10 @@ class WebRTCManager(
             currentOfferId = offerId
 
             createOffer { sdp ->
-                // 1. Try DHT Signaling (Robust for NAT/WAN)
+                // 1. Try DHT Signaling
                 signalingClient.sendOfferViaDHT(fingerprint, sdp, peerPubKey, offerId)
-                
-                // 2. Poll for the answer in the Postbox
+
+                // 2. Poll for the answer
                 signalingClient.watchPostBox(fingerprint) { answerSdp ->
                     handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, offerId, null)
                 }
@@ -1006,11 +1015,11 @@ class WebRTCManager(
                 // Start candidate poller for Trickle ICE
                 signalingClient.startCandidatePoller(fingerprint)
 
-                // 3. Simultaneously try direct TCP signaling (Fast for LAN/Cached)
+                // 3. Simultaneously try direct TCP signaling
                 scope.launch {
                     val addresses = signalingClient.lookupAddress(fingerprint).toMutableList()
                     Log.d(tag, "DHT Lookup for $fingerprint returned ${addresses.size} addresses")
-                    
+
                     // Add cached address if it exists
                     if (peer.lastKnownIp != null && peer.lastKnownPort != 0) {
                         if (addresses.none { it.first == peer.lastKnownIp && it.second == peer.lastKnownPort }) {
@@ -1038,7 +1047,7 @@ class WebRTCManager(
         val peerEphemeralKey = hexToBytes(json.getString("ephemeral_key"))
         val fingerprint = identityManager.getFingerprint(peerIdKey)
         
-        // RESOLVE IDENTITY: Trust local data over handshake data
+        // Resolve identity: Trust local data over handshake data
         var peerUsernameReceived = "Unknown Peer"
         runBlocking {
             val existingPeer = peerDao.getPeerByFingerprint(fingerprint)
@@ -1048,16 +1057,16 @@ class WebRTCManager(
             peerUsernameReceived = when {
                 // 1. If this matches the QR we just scanned, use the name from the QR
                 fingerprint == peerFingerprint -> peerUsername
-                
+
                 // 2. If they are in the database, use our saved name
                 existingPeer != null -> existingPeer.username
-                
+
                 // 3. If they sent a fingerprint as a name, sanitize it
                 fingerprintRegex.matches(incomingNameFromHandshake) -> {
                     val sanitized = identityManager.sanitizeUsername(incomingNameFromHandshake)
                     if (fingerprintRegex.matches(sanitized)) "Peer ${fingerprint.take(8)}" else sanitized
                 }
-                
+
                 // 4. New peer, use their provided name or fallback
                 else -> incomingNameFromHandshake.ifEmpty { "Unknown Peer" }
             }
@@ -1082,13 +1091,14 @@ class WebRTCManager(
         }
     }
 
+    // Finalize the secure session after keys are exchanged
     private fun completeHandshake(username: String, peerIdKey: ByteArray, peerEphemeralKey: ByteArray) {
         scope.launch {
             if (ephemeralPrivateKey == null) {
                 Log.w(tag, "Ephemeral key missing during handshake. Generating now...")
                 generateEphemeralKeys()
             }
-            
+
             if (ephemeralPrivateKey == null) {
                 Log.e(tag, "Failed to establish session: My ephemeral key is null")
                 return@launch
@@ -1102,7 +1112,7 @@ class WebRTCManager(
                     peerIdKey,
                     peerEphemeralKey
                 )
-                
+
                 if (pySession == null || pySession.toString() == "None") {
                     Log.e(tag, "Failed to establish session: Python returned None")
                     return@launch
@@ -1116,10 +1126,10 @@ class WebRTCManager(
                 protocol.setSession(session, dataChannel, peerFingerprint)
                 onStateChanged?.invoke("Connected")
 
-                // FLUSH PENDING MESSAGES
+                // Flush pending messages
                 val target = peerFingerprint!!
                 scope.launch(Dispatchers.IO) {
-                    delay(1000) // Small delay to let DataChannel stabilize
+                    delay(1000) // Wait for DataChannel to stabilize
                     val pending = messageDao.getPendingMessagesForPeer(target)
                     if (pending.isNotEmpty()) {
                         Log.i(tag, "Flushing ${pending.size} pending messages for $target")
@@ -1147,7 +1157,7 @@ class WebRTCManager(
     private fun thinSdp(sdp: String): String {
         val lines = sdp.lines()
         val filtered = mutableListOf<String>()
-        
+
         // Essential attributes for WebRTC handshake and basic media
         val essentialPrefixes = listOf(
             "v=", "o=", "s=", "t=", "c=", "a=group:", "a=msid-semantic:",
@@ -1159,7 +1169,7 @@ class WebRTCManager(
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
-            
+
             // Keep essential lines and anything not blacklisted
             if (essentialPrefixes.any { trimmed.startsWith(it) }) {
                 filtered.add(trimmed)

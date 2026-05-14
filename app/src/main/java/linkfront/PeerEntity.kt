@@ -3,11 +3,12 @@ package com.linkfront
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
+// Database model for a trusted peer
 @Entity(tableName = "peers")
 data class PeerEntity(
     @PrimaryKey val fingerprint: String, // Fingerprint is a unique identifier
     val username: String,
-    val identityKey: ByteArray, // The long-term public key
+    val identityKey: ByteArray, // Long-term public key (Ed25519)
     val sharedSecret: ByteArray? = null,
     val lastSentCounter: Int = 0,
     val lastReceivedCounter: Int = -1,

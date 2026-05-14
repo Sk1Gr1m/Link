@@ -6,6 +6,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
 
+// Data access object for peer information in the Room database
 @Dao
 interface PeerDao {
     @Query("SELECT * FROM peers ORDER BY lastSeen DESC")

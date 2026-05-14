@@ -16,6 +16,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
+// Handles message encryption, fragmentation, and assembly over WebRTC data channels
 class LinkProtocol(
     private val context: Context,
     private val messageDao: MessageDao,
@@ -36,6 +37,7 @@ class LinkProtocol(
         this.peerFingerprint = peerFingerprint
     }
 
+    // Encrypt and send a text message to a peer
     fun sendText(targetFingerprint: String, message: String) {
         Log.i(tag, "Sending text message to $targetFingerprint: ${message.take(20)}...")
         scope.launch(Dispatchers.IO) {
@@ -72,6 +74,7 @@ class LinkProtocol(
         }
     }
 
+    // Fragment and send an image file in multiple chunks
     fun sendImage(targetFingerprint: String, imageBytes: ByteArray) {
         Log.i(tag, "Starting image transfer to $targetFingerprint, size: ${imageBytes.size} bytes")
         scope.launch(Dispatchers.IO) {
@@ -134,6 +137,7 @@ class LinkProtocol(
         }
     }
 
+    // Encrypt a JSON packet and send it via the active DataChannel
     private fun encryptAndSend(json: JSONObject): Boolean {
         val s = session
         val dc = dataChannel
@@ -162,12 +166,12 @@ class LinkProtocol(
         }
     }
 
+    // Process raw bytes received from the WebRTC DataChannel
     fun onReceive(buffer: DataChannel.Buffer) {
         val data = ByteArray(buffer.data.remaining())
         buffer.data.get(data)
         
-        // 1. ALWAYS try to handle unencrypted handshake first
-        // This handles cases where the peer has reset their session but we haven't
+        // Always try to handle unencrypted handshake first
         try {
             val text = String(data, StandardCharsets.UTF_8)
             if (text.startsWith("{")) {
@@ -182,7 +186,7 @@ class LinkProtocol(
             // Not a valid handshake JSON, continue to encrypted handling
         }
 
-        // 2. Handle encrypted protocol messages
+        // Handle encrypted messages
         val s = session
         if (s == null || s.toString() == "None") return
         try {
@@ -235,6 +239,7 @@ class LinkProtocol(
         encryptAndSend(packet)
     }
 
+    // Handle an incoming image chunk and update transfer progress
     private fun handleImageChunk(json: JSONObject) {
         val transferId = json.getString("id")
         val index = json.getInt("index")

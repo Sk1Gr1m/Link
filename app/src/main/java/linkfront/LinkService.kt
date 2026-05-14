@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
 
+// Foreground service to maintain DHT and WebRTC connectivity in the background
 class LinkService : Service() {
     private val tag = "LinkService"
     private val job = SupervisorJob()
@@ -90,6 +91,7 @@ class LinkService : Service() {
         return START_STICKY
     }
 
+    // Listen for network changes to update the DHT node's external IP
     private fun registerNetworkCallback() {
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
@@ -123,6 +125,7 @@ class LinkService : Service() {
         })
     }
 
+    // Allow receiving UDP broadcast/multicast packets for local discovery
     private fun acquireMulticastLock() {
         try {
             if (multicastLock == null) {
@@ -150,6 +153,7 @@ class LinkService : Service() {
         }
     }
 
+    // Initialize the WebRTC manager and start the DHT node
     private fun initManager() {
         if (webrtcManager != null) return
 

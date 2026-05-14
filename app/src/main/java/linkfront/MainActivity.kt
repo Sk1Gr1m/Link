@@ -24,6 +24,7 @@ import com.linkfront.ui.screens.ProfileScreen
 import com.linkfront.ui.theme.LinkFrontTheme
 import kotlinx.coroutines.launch
 
+// Main entry point for the application, handles UI navigation and service binding
 class MainActivity : ComponentActivity() {
     
     private var linkService by mutableStateOf<LinkService?>(null)
@@ -92,6 +93,7 @@ class MainActivity : ComponentActivity() {
         unbindService(serviceConnection)
     }
 
+    // Main navigation and UI layout
     @Composable
     fun MainScreen(webrtcManager: WebRTCManager?) {
         val navController = rememberNavController()
@@ -134,6 +136,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Ensure camera and audio permissions are granted for WebRTC
     private fun checkAndRequestPermissions() {
         val permissionsToRequest = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -155,6 +158,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Start the background service that keeps the connection alive
     private fun initWebRTC() {
         val intent = Intent(this, LinkService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

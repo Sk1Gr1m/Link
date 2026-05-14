@@ -56,6 +56,7 @@ fun ChatScreen(
     onBack: () -> Unit,
     onClearHistory: () -> Unit
 ) {
+    // Screen for messaging a specific peer
     var textInput by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
 
@@ -73,6 +74,7 @@ fun ChatScreen(
     var messageToDelete by remember { mutableStateOf<MessageEntity?>(null) }
     var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
 
+    // Handle image selection from the gallery
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
@@ -146,7 +148,7 @@ fun ChatScreen(
         }
     }
 
-    // Monitor DHT status globally in chat
+    // Periodic check for DHT connection status
     var dhtConnected by remember { mutableStateOf(false) }
     LaunchedEffect(webrtcManager, dhtConnected) {
         if (webrtcManager == null) {
@@ -165,6 +167,7 @@ fun ChatScreen(
         }
     }
 
+    // Handle automatic connection and message resending
     LaunchedEffect(webrtcManager, webrtcManager?.connectionStatus, webrtcManager?.peerFingerprint, fingerprint, dhtConnected) {
         if (fingerprint == "SELF" || webrtcManager == null) return@LaunchedEffect
         
@@ -377,6 +380,7 @@ fun ChatScreen(
     }
 }
 
+// Individual message bubble UI
 @Composable
 fun ChatBubble(
     message: MessageEntity,
