@@ -58,7 +58,7 @@ Link is designed with privacy as its core principle:
 
 ## 📂 Project Structure
 
-- `app/src/main/java/com/example/linkfront`: Kotlin source code (UI, Services, WebRTC Management).
+- `app/src/main/java/linkfront`: Kotlin source code (UI, Services, WebRTC Management).
 - `app/src/main/python/linkfront`: Python networking logic (DHT node, packet handling, crypto).
 - `app/src/main/res`: Android resources, themes, and layouts.
 
