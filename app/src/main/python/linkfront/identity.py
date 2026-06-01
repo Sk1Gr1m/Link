@@ -1,3 +1,7 @@
+# Identity: Management of ED25519 keys and signing operations.
+# 1. Keys: Uses ED25519 for signing/identity and Curve25519 for encryption.
+# 2. Fingerprint: Human-readable ID formatted as ABCD:1234 from SHA-256 hash.
+# 3. QR: Logic for compact identity and SDP exchange via QR codes.
 import json
 import base64
 import time

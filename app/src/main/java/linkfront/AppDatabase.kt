@@ -5,7 +5,9 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-// Room database for storing messages and peer information
+// Room database: Persistent storage for messages and peer identities.
+// 1. Entities: MessageEntity (history) and PeerEntity (contacts/keys).
+// 2. Migration: Destructive - in early development.
 @Database(
     entities = [MessageEntity::class, PeerEntity::class],
     version = 16,

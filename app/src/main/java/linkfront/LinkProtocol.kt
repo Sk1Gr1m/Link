@@ -16,7 +16,10 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
-// Handles message encryption, fragmentation, and assembly over WebRTC data channels
+// Message protocol: Encryption, fragmentation, and reliable delivery.
+// 1. Encryption: All traffic is encrypted via the session keys.
+// 2. Fragmentation: Large binary data (image) is split into chunks to fit DataChannel limits.
+// 3. Reliability: Text messages use ACKs to confirm delivery; images track progress in Room.
 class LinkProtocol(
     private val context: Context,
     private val messageDao: MessageDao,

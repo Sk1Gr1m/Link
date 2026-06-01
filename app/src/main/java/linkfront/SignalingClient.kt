@@ -10,7 +10,11 @@ import java.net.ServerSocket
 import java.net.Socket
 import org.webrtc.IceCandidate
 
-// Handles direct TCP signaling and DHT message exchange
+// --- THE SIGNALING CLIENT ---
+// Handles the exchange of WebRTC "handshake" data (SDP and Candidates).
+// It uses a hybrid approach:
+// 1. Direct TCP: Fast path for peers in the same LAN or with open ports.
+// 2. DHT Polling: Fallback for peers behind NAT.
 class SignalingClient(
     private val identityManager: LinkIdentityManager,
     private val onOfferReceived: (String, String, (String) -> Unit) -> Unit,
@@ -124,11 +128,14 @@ class SignalingClient(
         }
     }
 
-    // Polls DHT for incoming WebRTC offers
+    // --- DHT OFFER POLLER (The Inbox) ---
+    // Every node has a "mailbox" in the DHT based on their Fingerprint.
+    // We check this mailbox every few seconds for incoming connection offers.
     private fun startOfferPoller() {
         scope.launch {
             while (isActive) {
                 try {
+                    // Call the Python DHT node to check for 'OFFER' signals
                     val result = linkModule.callAttr("receive_signal", identityManager.fingerprint, "", "OFFER")
                     if (result != null && result.toString() != "None") {
                         val signalJson = JSONObject(result.toString())
@@ -143,9 +150,11 @@ class SignalingClient(
                         Log.d(tag, "Received Offer via DHT from $senderFingerprint")
 
                         if (senderFingerprint.isNotEmpty() && senderIdKeyHex.isNotEmpty()) {
+                            // Start listening for their ICE candidates immediately
                             startCandidatePoller(senderFingerprint)
                             val senderIdKey = hexToBytes(senderIdKeyHex)
                             onOfferReceived(sdp, offerId) { answerSdp ->
+                                // Reply with our Answer SDP through the DHT
                                 sendAnswer(senderFingerprint, answerSdp, senderIdKey, offerId = offerId)
                             }
                         }
@@ -158,13 +167,17 @@ class SignalingClient(
         }
     }
 
-    // Polls DHT for incoming ICE candidates
-    fun startCandidatePoller(peerFingerprint: String) {
+    // --- DHT CANDIDATE POLLER (Trickle ICE Support) ---
+    // Candidates arrive asynchronously. We poll a specific channel for them.
+    fun startCandidatePoller(channelId: String) {
         scope.launch {
             val seen = mutableSetOf<String>()
+            Log.d(tag, "Starting candidate poller for channel: $channelId")
             while (isActive) {
                 try {
-                    val result = linkModule.callAttr("receive_signal", identityManager.fingerprint, peerFingerprint, "CANDIDATE")
+                    // Try polling using the channelId as the sender filter.
+                    // This allows us to receive candidates even before a full session is established.
+                    val result = linkModule.callAttr("receive_signal", identityManager.fingerprint, channelId, "CANDIDATE")
                     if (result != null && result.toString() != "None") {
                         val candidatesArr = JSONArray(result.toString())
                         for (i in 0 until candidatesArr.length()) {
@@ -177,6 +190,7 @@ class SignalingClient(
                                         json.getInt("sdpMLineIndex"),
                                         json.getString("sdp")
                                     )
+                                    // Inject the candidate into the WebRTC PeerConnection
                                     onIceCandidateReceived(candidate)
                                 } catch (e: Exception) {
                                     Log.e(tag, "Failed to parse candidate: ${e.message}")
@@ -211,7 +225,7 @@ class SignalingClient(
     }
 
     // Send an ICE candidate to a peer via DHT
-    fun sendCandidateViaDHT(targetFingerprint: String, candidate: IceCandidate, alternateChannel: String? = null) {
+    fun sendCandidateViaDHT(target: String, candidate: IceCandidate, alternateChannel: String? = null) {
         scope.launch {
             val cJson = JSONObject().apply {
                 put("sdpMid", candidate.sdpMid)
@@ -219,12 +233,13 @@ class SignalingClient(
                 put("sdp", candidate.sdp)
             }
             try {
-                // Send to primary fingerprint channel
-                linkModule.callAttr("send_signal", targetFingerprint, identityManager.fingerprint, "CANDIDATE", cJson.toString())
+                // We send the signal to the 'target' (which can be a fingerprint or an offerId)
+                // The 'sender' part of the key should be our fingerprint so they know who it's from
+                linkModule.callAttr("send_signal", target, identityManager.fingerprint, "CANDIDATE", cJson.toString())
                 
-                // If we have an offerId/handshake channel, also post there for discovery
-                if (alternateChannel != null && alternateChannel != targetFingerprint) {
-                    linkModule.callAttr("send_signal", targetFingerprint, alternateChannel, "CANDIDATE", cJson.toString())
+                // If we have an alternate channel (like an offerId), also post there as a fallback
+                if (alternateChannel != null && alternateChannel != target) {
+                    linkModule.callAttr("send_signal", alternateChannel, identityManager.fingerprint, "CANDIDATE", cJson.toString())
                 }
             } catch (e: Exception) {
                 Log.e(tag, "Failed to send candidate via DHT: ${e.message}")

@@ -1,3 +1,8 @@
+# DHT Node: Kademlia implementation for peer discovery and signaling.
+# 1. Discovery: Uses UDP broadcasts for LAN and Kademlia DHT for WAN.
+# 2. Bootstrapping: Connects to public DHT networks (BitTorrent, OpenDHT) to join the global swarm.
+# 3. Signaling: Stores WebRTC SDP and candidates in DHT "mailboxes" using deterministic keys.
+# 4. NAT Traversal: Implements manual STUN (RFC 5389) for public IP and NAT type detection.
 import asyncio
 import logging
 import urllib.request

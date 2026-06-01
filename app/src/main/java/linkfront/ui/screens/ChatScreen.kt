@@ -46,6 +46,10 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+// Chat UI: Messaging interface with peer state management.
+// 1. Reactivity: Uses collectAsState to update the message list from the Room database.
+// 2. Connectivity: Monitors DHT/WebRTC status to show "Connecting" vs "Connected".
+// 3. Resilience: Implements auto-resend logic for messages queued while offline.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(

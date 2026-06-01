@@ -28,6 +28,8 @@ import com.linkfront.WebRTCManager
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
+// debugger and connection establishment ui screen
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(

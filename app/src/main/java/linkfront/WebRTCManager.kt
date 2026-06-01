@@ -18,7 +18,13 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
-// Manages WebRTC connections, data channels, and peer handshake
+// Connectivity layers:
+// 1. Discovery: Find peer IP via DHT or LAN Broadcast.
+// 2. Signaling: Exchange WebRTC SDP (Offer/Answer).
+// 3. Transport: P2P data flow using WebRTC DataChannels.
+
+
+// Manages WebRTC connections, data channels and peer handshake
 class WebRTCManager(
     private val context: Context,
     private val messageDao: MessageDao,
@@ -92,14 +98,16 @@ class WebRTCManager(
         }
 
         signalingClient.start()
-        
-        // Detect NAT type and monitor DHT status
+
+        // --- THE NAT DISCOVERY FLOW ---
+        // This is critical for P2P. We need to know if we are behind a "Symmetric NAT".
+        // If we are, a direct direct connection via STUN is impossible, and we MUST use TURN.
         scope.launch {
             try {
-                delay(2000) // Give DHT time to start
+                delay(2000) // Give DHT/Network time to start
                 val dhtNode = Python.getInstance().getModule("linkfront.dht_node")
                 
-                // Monitor DHT status
+                // Monitor DHT status for UI and debugging
                 launch {
                     while (isActive) {
                         val status = dhtNode.callAttr("get_dht_status").toString()
@@ -108,6 +116,7 @@ class WebRTCManager(
                     }
                 }
 
+                // Call the Python STUN implementation to find our public IP and NAT type
                 val stunInfoJson = dhtNode.callAttr("get_stun_info").toString()
                 val stunInfo = JSONObject(stunInfoJson)
                 Log.i(tag, "NAT Type: ${stunInfo.optString("nat_type", "Unknown")}")
@@ -116,8 +125,13 @@ class WebRTCManager(
                     isSymmetricNat = true
                     Log.w(tag, "Symmetric NAT detected! Port prediction might be needed.")
 
-                    // Recreate connection safely if NAT type found late
-                    prepareForNewConnection()
+                    // If NAT type is found late, we might need to recreate the connection
+                    // with proper TURN/Relay gathering settings.
+                    mainHandler.post {
+                        if (connectionStatus == "Disconnected" && !isQrHandshakeActive && currentOfferId == null) {
+                            prepareForNewConnection()
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(tag, "STUN discovery failed: ${e.message}")
@@ -370,6 +384,9 @@ class WebRTCManager(
         peerConnection = null
     }
 
+    // --- THE GATHERING LOGIC (STUN/TURN) ---
+    // We need to collect "ICE Candidates" (our IPs).
+    // We wait until we have a 'relay' candidate (from a TURN server) if we are in a strong NAT.
     private fun finishGathering() {
         mainHandler.post {
             if (onIceGatheringComplete == null) return@post
@@ -378,19 +395,19 @@ class WebRTCManager(
             val sdp = currentLocalDesc?.description ?: ""
 
             if (!gatheringTimeoutReached) {
-                val hasRelay = sdp.contains("typ relay")
-                val hasSrflx = sdp.contains("typ srflx")
+                val hasRelay = sdp.contains("typ relay") // TURN candidate
+                val hasSrflx = sdp.contains("typ srflx") // STUN candidate
                 
-                // If symmetric NAT, we need a relay candidate.
+                // If symmetric NAT, wait for a relay candidate to ensure connectivity.
                 val shouldWaitMore = if (isSymmetricNat) {
-                    !hasRelay && gatheringAttempts < 25
+                    !hasRelay && gatheringAttempts < 40 // Increased timeout for relay discovery
                 } else {
                     !(hasSrflx || hasRelay) && gatheringAttempts < 16
                 }
 
                 if (!sdp.contains("a=candidate:") || shouldWaitMore || (currentLocalDesc == null && gatheringAttempts < 10)) {
                     gatheringAttempts++
-                    Log.d(tag, "Gathering in progress... Waiting... ($gatheringAttempts)")
+                    Log.d(tag, "Gathering in progress... Waiting... ($gatheringAttempts). HasRelay=$hasRelay")
                     mainHandler.postDelayed({ finishGathering() }, 500)
                     return@post
                 }
@@ -401,6 +418,7 @@ class WebRTCManager(
             
             currentLocalDesc?.let {
                 val fullSdp = it.description
+                // thin it to save QR code space / bandwidth.
                 val thinned = thinSdp(fullSdp)
                 val candidateCount = fullSdp.split("\n").count { line -> line.contains("a=candidate:") }
 
@@ -466,6 +484,9 @@ class WebRTCManager(
         }
     }
 
+    // --- TRICKLE ICE (Candidate Exchange) ---
+    // Instead of waiting for ALL candidates to be gathered, send them as they are found.
+    // This makes the connection start faster.
     private fun createPeerConnection(config: PeerConnection.RTCConfiguration): PeerConnection? {
         if (isDestroyed || peerConnectionFactory == null) return null
         return peerConnectionFactory!!.createPeerConnection(config, object : PeerConnection.Observer {
@@ -474,19 +495,19 @@ class WebRTCManager(
                     Log.d(tag, "Local Candidate discovered: ${candidate.sdp}")
 
                     // Forward candidate via Trickle ICE
-                    // We send to both the fingerprint (if known) and the offerId (handshake channel)
+                    // use a consistent target/channel logic so both sides can find each other in DHT
                     val target = peerFingerprint
                     val channel = currentOfferId
                     
                     if (target != null) {
+                        // If we know the peer fingerprint, send to their private mailbox
                         signalingClient.sendCandidateViaDHT(target, candidate, channel)
                     } else if (channel != null) {
-                        // If we don't know the peer yet (we are the offerer),
-                        // we must send to the offerId channel so the scanner can find us.
+                        // If we only have an offerId (during QR handshake), send to the offer channel
                         signalingClient.sendCandidateViaDHT(channel, candidate)
                     }
 
-                    // Update the DHT node if we find our public IP
+                    // Self-healing: Update our public IP in the DHT if we find it via STUN
                     if (candidate.sdp.contains("typ srflx")) {
                         val parts = candidate.sdp.split(" ")
                         if (parts.size > 4) {
@@ -601,12 +622,16 @@ class WebRTCManager(
         }
     }
 
+    // --- THE SYMMETRIC NAT BLAST (Port Prediction) ---
+    // When we see a public (srflx) candidate from a symmetric NAT peer, we know their
+    // router might have assigned a neighboring port. So port blasting it is.
     private fun blastCandidate(baseCandidate: IceCandidate) {
         val sdp = baseCandidate.sdp
         val parts = sdp.split(" ").toMutableList()
         if (parts.size > 5) {
             val originalPort = parts[5].toIntOrNull() ?: return
-            // Blast a range of ports for symmetric NAT
+            
+            // Blast a wider range of ports if we detected Symmetric NAT locally.
             val offsets = if (isSymmetricNat) {
                 listOf(-1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6)
             } else {
@@ -812,6 +837,12 @@ class WebRTCManager(
             val sdp = json.getString("sdp")
             val offerId = json.optString("offer_id", "legacy")
             val peerSignalingPort = json.optInt("port", 0)
+            val isPeerSymmetric = json.optBoolean("is_symmetric", false)
+
+            if (isPeerSymmetric) {
+                isSymmetricNat = true
+                Log.i(tag, "Peer reported Symmetric NAT. Adjusting gathering policy.")
+            }
 
             if (type == "offer") {
                 isQrHandshakeActive = true
@@ -846,11 +877,13 @@ class WebRTCManager(
                             put("port", signalingClient.localPort)
                             put("dht_port", status.optInt("listen_port", 0))
                             put("offer_id", offerId)
+                            put("is_symmetric", isSymmetricNat)
                         }
                         onAnswerReady?.invoke(answerJson.toString())
                     }
                 }
-                // Start listening for trickle ICE candidates
+                // Start listening for trickle ICE candidates from the offerer
+                // IMPORTANT: Use the offerId as the channel
                 signalingClient.startCandidatePoller(offerId)
             } else if (type == "answer") {
                 // Peer A scans Peer B's answer
@@ -913,18 +946,23 @@ class WebRTCManager(
                     put("port", signalingClient.localPort)
                     put("dht_port", dhtPort)
                     put("offer_id", offerId)
+                    put("is_symmetric", isSymmetricNat)
                 }
                 callback(json.toString())
 
                 signalingClient.watchPostBox(offerId) { answerSdp ->
                     handleRemoteSdp(answerSdp, SessionDescription.Type.ANSWER, offerId, null)
                 }
-                // Start listening for trickle ICE candidates
+                // Start listening for trickle ICE candidates from the scanner
+                // IMPORTANT: Use the offerId as the channel
                 signalingClient.startCandidatePoller(offerId)
             }
         }
     }
 
+    // --- SECURE HANDSHAKE (Session Key Exchange) ---
+    // Once the WebRTC DataChannel is OPEN.
+    // We send an ephemeral key to establish a secure, encrypted session in the protocol layer.
     private fun sendHandshake() {
         if (handshakeSent) {
             Log.d(tag, "Handshake already sent. Skipping.")
@@ -951,7 +989,7 @@ class WebRTCManager(
             put("ephemeral_key", bytesToHex(ephemeralPublicKey!!))
         }
         Log.i(tag, "Sending handshake to peer...")
-        // Use a raw message for handshake
+        // Use a raw message for handshake over the newly opened DataChannel
         dataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(handshake.toString().toByteArray()), false))
         handshakeSent = true
     }

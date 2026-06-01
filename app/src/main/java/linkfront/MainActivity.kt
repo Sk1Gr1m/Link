@@ -103,6 +103,7 @@ class MainActivity : ComponentActivity() {
             composable("home") {
                 HomeScreen(
                     peerDao = peerDao,
+                    messageDao = messageDao,
                     onNewConnection = { navController.navigate("profile") },
                     onChatSelected = { fingerprint ->
                         navController.navigate("chat/$fingerprint")

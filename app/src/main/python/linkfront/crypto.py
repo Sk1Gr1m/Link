@@ -1,3 +1,7 @@
+# Cryptography: PyNaCl (libsodium) wrapper for encryption and key exchange.
+# 1. Conversion: Maps Ed25519 signing keys to Curve25519 encryption keys.
+# 2. Handshake: Triple Diffie-Hellman derivation using ephemeral and static keys.
+# 3. Session: Generates a shared secret for symmetric encryption via Blake2b hashing.
 from nacl.secret import SecretBox
 from nacl.public import PrivateKey, PublicKey, SealedBox
 from nacl.signing import SigningKey, VerifyKey

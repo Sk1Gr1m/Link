@@ -8,7 +8,10 @@ import androidx.core.content.edit
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 
-// Manages the user's cryptographic identity and username
+// Identity management: Handles ED25519 keys and fingerprint generation.
+// 1. Storage: Private key is stored in SharedPreferences.
+// 2. Identity: Fingerprint is a SHA-256 hash of the public key.
+// 3. Validation: Sanitize usernames to avoid control characters or spoofing.
 class LinkIdentityManager(private val context: Context) {
     private val py = Python.getInstance()
     private val linkModule = py.getModule("linkfront")

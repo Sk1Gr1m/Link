@@ -1,3 +1,7 @@
+# Session: Symmetric encryption for established connections.
+# 1. Encryption: Uses SecretBox for authenticated encryption.
+# 2. Replay Protection: Implements a counter-based system to prevent message replay.
+# 3. State: Manages the shared secret and message ordering.
 from nacl.secret import SecretBox
 from nacl.utils import random
 

@@ -14,14 +14,20 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
+import com.linkfront.MessageDao
 import com.linkfront.PeerDao
 import com.linkfront.PeerEntity
 import kotlinx.coroutines.launch
 
+// Home Screen: Contact list and connection entry point.
+// 1. Data: Displays peers from the PeerDao database.
+// 2. Navigation: Routes users to Chat or Profile screens.
+// 3. Management: Allows deleting contacts and their associated cryptographic trust.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     peerDao: PeerDao,
+    messageDao: MessageDao,
     onNewConnection: () -> Unit,
     onChatSelected: (String) -> Unit,
     onProfileClick: () -> Unit
@@ -42,7 +48,10 @@ fun HomeScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        scope.launch { peerDao.delete(peer) }
+                        scope.launch { 
+                            messageDao.deleteMessagesForPeer(peer.fingerprint)
+                            peerDao.delete(peer) 
+                        }
                         peerToDelete = null
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
